@@ -1,34 +1,61 @@
-// Luanti
-// SPDX-License-Identifier: LGPL-2.1-or-later
-// Copyright (C) 2010-2013 celeron55, Perttu Ahola <celeron55@gmail.com>
+/*
+Minetest
+Copyright (C) 2010-2013 celeron55, Perttu Ahola <celeron55@gmail.com>
 
-#include "game_internal.h"
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU Lesser General Public License as published by
+the Free Software Foundation; either version 2.1 of the License, or
+(at your option) any later version.
 
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Lesser General Public License for more details.
+
+You should have received a copy of the GNU Lesser General Public License along
+with this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
+
+#include "game.h"
+
+#include <iomanip>
 #include <cmath>
-#include <csignal>
+#include "client/renderingengine.h"
+#include "camera.h"
+#include "client.h"
+#include "client/clientevent.h"
 #include "client/gameui.h"
 #include "client/inputhandler.h"
 #include "client/texturepaths.h"
 #include "client/keys.h"
+#include "client/joystick_controller.h"
 #include "client/mapblock_mesh.h"
 #include "client/sound.h"
 #include "clientmap.h"
 #include "clientmedia.h" // For clientMediaUpdateCacheCopy
+#include "clouds.h"
 #include "config.h"
 #include "content_cao.h"
 #include "content/subgames.h"
 #include "client/event_manager.h"
 #include "fontengine.h"
+#include "gui/touchscreengui.h"
 #include "itemdef.h"
+#include "log.h"
+#include "filesys.h"
 #include "gameparams.h"
 #include "gettext.h"
 #include "gui/guiChatConsole.h"
-#include "texturesource.h"
+#include "gui/guiFormSpecMenu.h"
+#include "gui/guiKeyChangeMenu.h"
+#include "gui/guiPasswordChange.h"
+#include "gui/guiOpenURL.h"
+#include "gui/guiVolumeChange.h"
 #include "gui/mainmenumanager.h"
 #include "gui/profilergraph.h"
-#include "localplayer.h"
+#include "mapblock.h"
 #include "minimap.h"
-#include "network/networkexceptions.h"
 #include "nodedef.h"         // Needed for determining pointing to nodes
 #include "nodemetadata.h"
 #include "particles.h"
@@ -38,54 +65,333 @@
 #include "server.h"
 #include "settings.h"
 #include "shader.h"
-#include "sound_maker.h"
+#include "sky.h"
 #include "threading/lambda.h"
 #include "translation.h"
 #include "util/basic_macros.h"
 #include "util/directiontables.h"
+#include "util/pointedthing.h"
 #include "util/quicktune_shortcutter.h"
+#include "irrlicht_changes/static_text.h"
+#include "irr_ptr.h"
 #include "version.h"
 #include "script/scripting_client.h"
 #include "hud.h"
-#include <AnimatedMeshSceneNode.h>
-#include <ICameraSceneNode.h>
-#include "util/tracy_wrapper.h"
-#include "item_visuals_manager.h"
+#include "clientdynamicinfo.h"
+#include <IAnimatedMeshSceneNode.h>
 
 #if USE_SOUND
 	#include "client/sound/sound_openal.h"
 #endif
 
+/*
+	Text input system
+*/
+
+struct TextDestNodeMetadata : public TextDest
+{
+	TextDestNodeMetadata(v3s16 p, Client *client)
+	{
+		m_p = p;
+		m_client = client;
+	}
+	// This is deprecated I guess? -celeron55
+	void gotText(const std::wstring &text)
+	{
+		std::string ntext = wide_to_utf8(text);
+		infostream << "Submitting 'text' field of node at (" << m_p.X << ","
+			   << m_p.Y << "," << m_p.Z << "): " << ntext << std::endl;
+		StringMap fields;
+		fields["text"] = ntext;
+		m_client->sendNodemetaFields(m_p, "", fields);
+	}
+	void gotText(const StringMap &fields)
+	{
+		m_client->sendNodemetaFields(m_p, "", fields);
+	}
+
+	v3s16 m_p;
+	Client *m_client;
+};
+
+struct TextDestPlayerInventory : public TextDest
+{
+	TextDestPlayerInventory(Client *client)
+	{
+		m_client = client;
+		m_formname.clear();
+	}
+	TextDestPlayerInventory(Client *client, const std::string &formname)
+	{
+		m_client = client;
+		m_formname = formname;
+	}
+	void gotText(const StringMap &fields)
+	{
+		m_client->sendInventoryFields(m_formname, fields);
+	}
+
+	Client *m_client;
+};
+
+struct LocalFormspecHandler : public TextDest
+{
+	LocalFormspecHandler(const std::string &formname)
+	{
+		m_formname = formname;
+	}
+
+	LocalFormspecHandler(const std::string &formname, Client *client):
+		m_client(client)
+	{
+		m_formname = formname;
+	}
+
+	void gotText(const StringMap &fields)
+	{
+		if (m_formname == "MT_PAUSE_MENU") {
+			if (fields.find("btn_sound") != fields.end()) {
+				g_gamecallback->changeVolume();
+				return;
+			}
+
+			if (fields.find("btn_key_config") != fields.end()) {
+				g_gamecallback->keyConfig();
+				return;
+			}
+
+			if (fields.find("btn_exit_menu") != fields.end()) {
+				g_gamecallback->disconnect();
+				return;
+			}
+
+			if (fields.find("btn_exit_os") != fields.end()) {
+				g_gamecallback->exitToOS();
+#ifndef __ANDROID__
+				RenderingEngine::get_raw_device()->closeDevice();
+#endif
+				return;
+			}
+
+			if (fields.find("btn_change_password") != fields.end()) {
+				g_gamecallback->changePassword();
+				return;
+			}
+
+			return;
+		}
+
+		if (m_formname == "MT_DEATH_SCREEN") {
+			assert(m_client != nullptr);
+
+			if (fields.find("quit") != fields.end())
+				m_client->sendRespawn();
+
+			return;
+		}
+
+		if (m_client->modsLoaded())
+			m_client->getScript()->on_formspec_input(m_formname, fields);
+	}
+
+	Client *m_client = nullptr;
+};
+
+/* Form update callback */
+
+class NodeMetadataFormSource: public IFormSource
+{
+public:
+	NodeMetadataFormSource(ClientMap *map, v3s16 p):
+		m_map(map),
+		m_p(p)
+	{
+	}
+	const std::string &getForm() const
+	{
+		static const std::string empty_string = "";
+		NodeMetadata *meta = m_map->getNodeMetadata(m_p);
+
+		if (!meta)
+			return empty_string;
+
+		return meta->getString("formspec");
+	}
+
+	virtual std::string resolveText(const std::string &str)
+	{
+		NodeMetadata *meta = m_map->getNodeMetadata(m_p);
+
+		if (!meta)
+			return str;
+
+		return meta->resolveString(str);
+	}
+
+	ClientMap *m_map;
+	v3s16 m_p;
+};
+
+class PlayerInventoryFormSource: public IFormSource
+{
+public:
+	PlayerInventoryFormSource(Client *client):
+		m_client(client)
+	{
+	}
+
+	const std::string &getForm() const
+	{
+		LocalPlayer *player = m_client->getEnv().getLocalPlayer();
+		return player->inventory_formspec;
+	}
+
+	Client *m_client;
+};
+
+class NodeDugEvent : public MtEvent
+{
+public:
+	v3s16 p;
+	MapNode n;
+
+	NodeDugEvent(v3s16 p, MapNode n):
+		p(p),
+		n(n)
+	{}
+	Type getType() const { return NODE_DUG; }
+};
+
+class SoundMaker
+{
+	ISoundManager *m_sound;
+	const NodeDefManager *m_ndef;
+
+public:
+	bool makes_footstep_sound = true;
+	float m_player_step_timer = 0.0f;
+	float m_player_jump_timer = 0.0f;
+
+	SoundSpec m_player_step_sound;
+	SoundSpec m_player_leftpunch_sound;
+	// Second sound made on left punch, currently used for item 'use' sound
+	SoundSpec m_player_leftpunch_sound2;
+	SoundSpec m_player_rightpunch_sound;
+
+	SoundMaker(ISoundManager *sound, const NodeDefManager *ndef) :
+		m_sound(sound), m_ndef(ndef) {}
+
+	void playPlayerStep()
+	{
+		if (m_player_step_timer <= 0 && m_player_step_sound.exists()) {
+			m_player_step_timer = 0.03;
+			if (makes_footstep_sound)
+				m_sound->playSound(0, m_player_step_sound);
+		}
+	}
+
+	void playPlayerJump()
+	{
+		if (m_player_jump_timer <= 0.0f) {
+			m_player_jump_timer = 0.2f;
+			m_sound->playSound(0, SoundSpec("player_jump", 0.5f));
+		}
+	}
+
+	static void viewBobbingStep(MtEvent *e, void *data)
+	{
+		SoundMaker *sm = (SoundMaker *)data;
+		sm->playPlayerStep();
+	}
+
+	static void playerRegainGround(MtEvent *e, void *data)
+	{
+		SoundMaker *sm = (SoundMaker *)data;
+		sm->playPlayerStep();
+	}
+
+	static void playerJump(MtEvent *e, void *data)
+	{
+		SoundMaker *sm = (SoundMaker *)data;
+		sm->playPlayerJump();
+	}
+
+	static void cameraPunchLeft(MtEvent *e, void *data)
+	{
+		SoundMaker *sm = (SoundMaker *)data;
+		sm->m_sound->playSound(0, sm->m_player_leftpunch_sound);
+		sm->m_sound->playSound(0, sm->m_player_leftpunch_sound2);
+	}
+
+	static void cameraPunchRight(MtEvent *e, void *data)
+	{
+		SoundMaker *sm = (SoundMaker *)data;
+		sm->m_sound->playSound(0, sm->m_player_rightpunch_sound);
+	}
+
+	static void nodeDug(MtEvent *e, void *data)
+	{
+		SoundMaker *sm = (SoundMaker *)data;
+		NodeDugEvent *nde = (NodeDugEvent *)e;
+		sm->m_sound->playSound(0, sm->m_ndef->get(nde->n).sound_dug);
+	}
+
+	static void playerDamage(MtEvent *e, void *data)
+	{
+		SoundMaker *sm = (SoundMaker *)data;
+		sm->m_sound->playSound(0, SoundSpec("player_damage", 0.5));
+	}
+
+	static void playerFallingDamage(MtEvent *e, void *data)
+	{
+		SoundMaker *sm = (SoundMaker *)data;
+		sm->m_sound->playSound(0, SoundSpec("player_falling_damage", 0.5));
+	}
+
+	void registerReceiver(MtEventManager *mgr)
+	{
+		mgr->reg(MtEvent::VIEW_BOBBING_STEP, SoundMaker::viewBobbingStep, this);
+		mgr->reg(MtEvent::PLAYER_REGAIN_GROUND, SoundMaker::playerRegainGround, this);
+		mgr->reg(MtEvent::PLAYER_JUMP, SoundMaker::playerJump, this);
+		mgr->reg(MtEvent::CAMERA_PUNCH_LEFT, SoundMaker::cameraPunchLeft, this);
+		mgr->reg(MtEvent::CAMERA_PUNCH_RIGHT, SoundMaker::cameraPunchRight, this);
+		mgr->reg(MtEvent::NODE_DUG, SoundMaker::nodeDug, this);
+		mgr->reg(MtEvent::PLAYER_DAMAGE, SoundMaker::playerDamage, this);
+		mgr->reg(MtEvent::PLAYER_FALLING_DAMAGE, SoundMaker::playerFallingDamage, this);
+	}
+
+	void step(float dtime)
+	{
+		m_player_step_timer -= dtime;
+		m_player_jump_timer -= dtime;
+	}
+};
+
+
 typedef s32 SamplerLayer_t;
 
 
-class GameGlobalShaderUniformSetter : public IShaderUniformSetter
+class GameGlobalShaderConstantSetter : public IShaderConstantSetter
 {
 	Sky *m_sky;
 	Client *m_client;
-
 	CachedVertexShaderSetting<float> m_animation_timer_vertex{"animationTimer"};
 	CachedPixelShaderSetting<float> m_animation_timer_pixel{"animationTimer"};
 	CachedVertexShaderSetting<float>
 		m_animation_timer_delta_vertex{"animationTimerDelta"};
 	CachedPixelShaderSetting<float>
 		m_animation_timer_delta_pixel{"animationTimerDelta"};
-	int m_crack_animation_length_i;
-	CachedPixelShaderSetting<float> m_crack_animation_length{"crackAnimationLength"};
-	int m_crack_level_i = -1;
-	CachedPixelShaderSetting<float> m_crack_level{"crackLevel"};
-	int m_crack_texture_scale_i = 0;
-	CachedPixelShaderSetting<float> m_crack_texture_scale{"crackTextureScale"};
 	CachedPixelShaderSetting<float, 3> m_day_light{"dayLight"};
 	CachedPixelShaderSetting<float, 3> m_minimap_yaw{"yawVec"};
 	CachedPixelShaderSetting<float, 3> m_camera_offset_pixel{"cameraOffset"};
 	CachedVertexShaderSetting<float, 3> m_camera_offset_vertex{"cameraOffset"};
-	CachedPixelShaderSetting<float, 3> m_camera_position_pixel{"cameraPosition"};
-	CachedVertexShaderSetting<float, 3> m_camera_position_vertex{"cameraPosition"};
+	CachedPixelShaderSetting<SamplerLayer_t> m_texture0{"texture0"};
+	CachedPixelShaderSetting<SamplerLayer_t> m_texture1{"texture1"};
+	CachedPixelShaderSetting<SamplerLayer_t> m_texture2{"texture2"};
+	CachedPixelShaderSetting<SamplerLayer_t> m_texture3{"texture3"};
 	CachedVertexShaderSetting<float, 2> m_texel_size0_vertex{"texelSize0"};
 	CachedPixelShaderSetting<float, 2> m_texel_size0_pixel{"texelSize0"};
 	v2f m_texel_size0;
-
 	CachedStructPixelShaderSetting<float, 7> m_exposure_params_pixel{
 		"exposureParams",
 		std::array<const char*, 7> {
@@ -96,8 +402,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	float m_user_exposure_compensation;
 	bool m_bloom_enabled;
 	CachedPixelShaderSetting<float> m_bloom_intensity_pixel{"bloomIntensity"};
+	float m_bloom_intensity;
 	CachedPixelShaderSetting<float> m_bloom_strength_pixel{"bloomStrength"};
+	float m_bloom_strength;
 	CachedPixelShaderSetting<float> m_bloom_radius_pixel{"bloomRadius"};
+	float m_bloom_radius;
 	CachedPixelShaderSetting<float> m_saturation_pixel{"saturation"};
 	bool m_volumetric_light_enabled;
 	CachedPixelShaderSetting<float, 3>
@@ -109,8 +418,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 1> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 4> SETTING_CALLBACKS = {
 		"exposure_compensation",
+		"bloom_intensity",
+		"bloom_strength_factor",
+		"bloom_radius"
 	};
 
 public:
@@ -118,34 +430,43 @@ public:
 	{
 		if (name == "exposure_compensation")
 			m_user_exposure_compensation = g_settings->getFloat("exposure_compensation", -1.0f, 1.0f);
+		if (name == "bloom_intensity")
+			m_bloom_intensity = g_settings->getFloat("bloom_intensity", 0.01f, 1.0f);
+		if (name == "bloom_strength_factor")
+			m_bloom_strength = RenderingEngine::BASE_BLOOM_STRENGTH * g_settings->getFloat("bloom_strength_factor", 0.1f, 10.0f);
+		if (name == "bloom_radius")
+			m_bloom_radius = g_settings->getFloat("bloom_radius", 0.1f, 8.0f);
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
 	{
-		reinterpret_cast<GameGlobalShaderUniformSetter*>(userdata)->onSettingsChange(name);
+		reinterpret_cast<GameGlobalShaderConstantSetter*>(userdata)->onSettingsChange(name);
 	}
 
 	void setSky(Sky *sky) { m_sky = sky; }
 
-	GameGlobalShaderUniformSetter(Sky *sky, Game *game) :
+	GameGlobalShaderConstantSetter(Sky *sky, Client *client) :
 		m_sky(sky),
-		m_client(game->getClient())
+		m_client(client)
 	{
 		for (auto &name : SETTING_CALLBACKS)
 			g_settings->registerChangedCallback(name, settingsCallback, this);
 
 		m_user_exposure_compensation = g_settings->getFloat("exposure_compensation", -1.0f, 1.0f);
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
+		m_bloom_intensity = g_settings->getFloat("bloom_intensity", 0.01f, 1.0f);
+		m_bloom_strength = RenderingEngine::BASE_BLOOM_STRENGTH * g_settings->getFloat("bloom_strength_factor", 0.1f, 10.0f);
+		m_bloom_radius = g_settings->getFloat("bloom_radius", 0.1f, 8.0f);
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
-		m_crack_animation_length_i = game->crack_animation_length;
 	}
 
-	~GameGlobalShaderUniformSetter()
+	~GameGlobalShaderConstantSetter()
 	{
-		g_settings->deregisterAllChangedCallbacks(this);
+		for (auto &name : SETTING_CALLBACKS)
+			g_settings->deregisterChangedCallback(name, settingsCallback, this);
 	}
 
-	void onSetUniforms(video::IMaterialRendererServices *services) override
+	void onSetConstants(video::IMaterialRendererServices *services) override
 	{
 		u32 daynight_ratio = (float)m_client->getEnv().getDayNightRatio();
 		video::SColorf sunlight;
@@ -170,25 +491,20 @@ public:
 		m_camera_offset_pixel.set(offset, services);
 		m_camera_offset_vertex.set(offset, services);
 
-		v3f camera_position = m_client->getCamera()->getPosition();
-		m_camera_position_pixel.set(camera_position, services);
-		m_camera_position_pixel.set(camera_position, services);
+		SamplerLayer_t tex_id;
+		tex_id = 0;
+		m_texture0.set(&tex_id, services);
+		tex_id = 1;
+		m_texture1.set(&tex_id, services);
+		tex_id = 2;
+		m_texture2.set(&tex_id, services);
+		tex_id = 3;
+		m_texture3.set(&tex_id, services);
 
 		m_texel_size0_vertex.set(m_texel_size0, services);
 		m_texel_size0_pixel.set(m_texel_size0, services);
 
-		{
-			float tmp = m_crack_animation_length_i;
-			m_crack_animation_length.set(&tmp, services);
-			tmp = m_crack_level_i;
-			m_crack_level.set(&tmp, services);
-			tmp = m_crack_texture_scale_i;
-			m_crack_texture_scale.set(&tmp, services);
-		}
-
-		const auto &lighting = m_client->getEnv().getLocalPlayer()->getLighting();
-
-		const AutoExposure &exposure_params = lighting.exposure;
+		const AutoExposure &exposure_params = m_client->getEnv().getLocalPlayer()->getLighting().exposure;
 		std::array<float, 7> exposure_buffer = {
 			std::pow(2.0f, exposure_params.luminance_min),
 			std::pow(2.0f, exposure_params.luminance_max),
@@ -201,14 +517,12 @@ public:
 		m_exposure_params_pixel.set(exposure_buffer.data(), services);
 
 		if (m_bloom_enabled) {
-			float intensity = std::max(lighting.bloom_intensity, 0.0f);
-			m_bloom_intensity_pixel.set(&intensity, services);
-			float strength_factor = std::max(lighting.bloom_strength_factor, 0.0f);
-			m_bloom_strength_pixel.set(&strength_factor, services);
-			float radius = std::max(lighting.bloom_radius, 0.0f);
-			m_bloom_radius_pixel.set(&radius, services);
+			m_bloom_intensity_pixel.set(&m_bloom_intensity, services);
+			m_bloom_radius_pixel.set(&m_bloom_radius, services);
+			m_bloom_strength_pixel.set(&m_bloom_strength, services);
 		}
 
+		const auto &lighting = m_client->getEnv().getLocalPlayer()->getLighting();
 		float saturation = lighting.saturation;
 		m_saturation_pixel.set(&saturation, services);
 
@@ -259,11 +573,6 @@ public:
 
 	void onSetMaterial(const video::SMaterial &material) override
 	{
-		// This is set only for node materials which have a crack, see mapblock_mesh.cpp.
-		auto pair = MapBlockMesh::unpackCrackMaterialParam(material.MaterialTypeParam);
-		m_crack_level_i = pair.first;
-		m_crack_texture_scale_i = pair.second;
-
 		video::ITexture *texture = material.getTexture(0);
 		if (texture) {
 			core::dimension2du size = texture->getSize();
@@ -275,127 +584,448 @@ public:
 };
 
 
-class GameGlobalShaderUniformSetterFactory : public IShaderUniformSetterFactory
+class GameGlobalShaderConstantSetterFactory : public IShaderConstantSetterFactory
 {
 	Sky *m_sky = nullptr;
-	Game *m_game;
-	std::vector<GameGlobalShaderUniformSetter*> created_nosky;
+	Client *m_client;
+	std::vector<GameGlobalShaderConstantSetter *> created_nosky;
 public:
-	GameGlobalShaderUniformSetterFactory(Game *game) :
-		m_game(game)
+	GameGlobalShaderConstantSetterFactory(Client *client) :
+		m_client(client)
 	{}
 
-	void setSky(Sky *sky)
-	{
+	void setSky(Sky *sky) {
 		m_sky = sky;
-		for (GameGlobalShaderUniformSetter *ggscs : created_nosky) {
+		for (GameGlobalShaderConstantSetter *ggscs : created_nosky) {
 			ggscs->setSky(m_sky);
 		}
 		created_nosky.clear();
 	}
 
-	virtual IShaderUniformSetter* create(const std::string &name)
+	virtual IShaderConstantSetter* create()
 	{
-		if (str_starts_with(name, "shadow/"))
-			return nullptr;
-		auto *scs = new GameGlobalShaderUniformSetter(m_sky, m_game);
+		auto *scs = new GameGlobalShaderConstantSetter(m_sky, m_client);
 		if (!m_sky)
 			created_nosky.push_back(scs);
 		return scs;
 	}
 };
 
-class NodeShaderConstantSetter : public IShaderConstantSetter
-{
-public:
-	NodeShaderConstantSetter() = default;
-	~NodeShaderConstantSetter() = default;
-
-	void onGenerate(const std::string &name, ShaderConstants &constants) override
-	{
-		if (constants.find("MATERIAL_TYPE") == constants.end())
-			return; // not a node shader
-		[[maybe_unused]] const auto material_type =
-			static_cast<MaterialType>(std::get<int>(constants["MATERIAL_TYPE"]));
-
-#define PROVIDE(constant) constants[ #constant ] = (int)constant
-
-		PROVIDE(TILE_MATERIAL_BASIC);
-		PROVIDE(TILE_MATERIAL_ALPHA);
-		PROVIDE(TILE_MATERIAL_LIQUID_TRANSPARENT);
-		PROVIDE(TILE_MATERIAL_LIQUID_OPAQUE);
-		PROVIDE(TILE_MATERIAL_WAVING_LEAVES);
-		PROVIDE(TILE_MATERIAL_WAVING_PLANTS);
-		PROVIDE(TILE_MATERIAL_OPAQUE);
-		PROVIDE(TILE_MATERIAL_WAVING_LIQUID_BASIC);
-		PROVIDE(TILE_MATERIAL_WAVING_LIQUID_TRANSPARENT);
-		PROVIDE(TILE_MATERIAL_WAVING_LIQUID_OPAQUE);
-		PROVIDE(TILE_MATERIAL_PLAIN);
-		PROVIDE(TILE_MATERIAL_PLAIN_ALPHA);
-
-#undef PROVIDE
-
-		bool enable_waving_water = g_settings->getBool("enable_waving_water");
-		constants["ENABLE_WAVING_WATER"] = enable_waving_water ? 1 : 0;
-		if (enable_waving_water) {
-			constants["WATER_WAVE_HEIGHT"] = g_settings->getFloat("water_wave_height");
-			constants["WATER_WAVE_LENGTH"] = g_settings->getFloat("water_wave_length");
-			constants["WATER_WAVE_SPEED"] = g_settings->getFloat("water_wave_speed");
-		}
-		switch (material_type) {
-			case TILE_MATERIAL_WAVING_LIQUID_TRANSPARENT:
-			case TILE_MATERIAL_WAVING_LIQUID_OPAQUE:
-			case TILE_MATERIAL_WAVING_LIQUID_BASIC:
-				constants["MATERIAL_WAVING_LIQUID"] = 1;
-				break;
-			default:
-				constants["MATERIAL_WAVING_LIQUID"] = 0;
-				break;
-		}
-		switch (material_type) {
-			case TILE_MATERIAL_WAVING_LIQUID_TRANSPARENT:
-			case TILE_MATERIAL_WAVING_LIQUID_OPAQUE:
-			case TILE_MATERIAL_WAVING_LIQUID_BASIC:
-			case TILE_MATERIAL_LIQUID_TRANSPARENT:
-				constants["MATERIAL_WATER_REFLECTIONS"] = 1;
-				break;
-			default:
-				constants["MATERIAL_WATER_REFLECTIONS"] = 0;
-				break;
-		}
-
-		constants["ENABLE_WAVING_LEAVES"] = g_settings->getBool("enable_waving_leaves") ? 1 : 0;
-		constants["ENABLE_WAVING_PLANTS"] = g_settings->getBool("enable_waving_plants") ? 1 : 0;
-	}
-};
+#define SIZE_TAG "size[11,5.5,true]" // Fixed size (ignored in touchscreen mode)
 
 /****************************************************************************
  ****************************************************************************/
+
+const static float object_hit_delay = 0.2;
+
+/* The reason the following structs are not anonymous structs within the
+ * class is that they are not used by the majority of member functions and
+ * many functions that do require objects of thse types do not modify them
+ * (so they can be passed as a const qualified parameter)
+ */
+
+struct GameRunData {
+	u16 dig_index;
+	u16 new_playeritem;
+	PointedThing pointed_old;
+	bool digging;
+	bool punching;
+	bool btn_down_for_dig;
+	bool dig_instantly;
+	bool digging_blocked;
+	bool reset_jump_timer;
+	float nodig_delay_timer;
+	float dig_time;
+	float dig_time_complete;
+	float repeat_place_timer;
+	float object_hit_delay_timer;
+	float time_from_last_punch;
+	ClientActiveObject *selected_object;
+
+	float jump_timer_up;          // from key up until key down
+	float jump_timer_down;        // since last key down
+	float jump_timer_down_before; // from key down until key down again
+
+	float damage_flash;
+	float update_draw_list_timer;
+	float touch_blocks_timer;
+
+	f32 fog_range;
+
+	v3f update_draw_list_last_cam_dir;
+
+	float time_of_day_smooth;
+};
+
+class Game;
+
+struct ClientEventHandler
+{
+	void (Game::*handler)(ClientEvent *, CameraOrientation *);
+};
+
+/****************************************************************************
+ THE GAME
+ ****************************************************************************/
+
+using PausedNodesList = std::vector<std::pair<irr_ptr<scene::IAnimatedMeshSceneNode>, float>>;
+
+/* This is not intended to be a public class. If a public class becomes
+ * desirable then it may be better to create another 'wrapper' class that
+ * hides most of the stuff in this class (nothing in this class is required
+ * by any other file) but exposes the public methods/data only.
+ */
+class Game {
+public:
+	Game();
+	~Game();
+
+	bool startup(bool *kill,
+			InputHandler *input,
+			RenderingEngine *rendering_engine,
+			const GameStartData &game_params,
+			std::string &error_message,
+			bool *reconnect,
+			ChatBackend *chat_backend);
+
+	void run();
+	void shutdown();
+
+protected:
+
+	// Basic initialisation
+	bool init(const std::string &map_dir, const std::string &address,
+			u16 port, const SubgameSpec &gamespec);
+	bool initSound();
+	bool createSingleplayerServer(const std::string &map_dir,
+			const SubgameSpec &gamespec, u16 port);
+	void copyServerClientCache();
+
+	// Client creation
+	bool createClient(const GameStartData &start_data);
+	bool initGui();
+
+	// Client connection
+	bool connectToServer(const GameStartData &start_data,
+			bool *connect_ok, bool *aborted);
+	bool getServerContent(bool *aborted);
+
+	// Main loop
+
+	void updateInteractTimers(f32 dtime);
+	bool checkConnection();
+	bool handleCallbacks();
+	void processQueues();
+	void updateProfilers(const RunStats &stats, const FpsControl &draw_times, f32 dtime);
+	void updateDebugState();
+	void updateStats(RunStats *stats, const FpsControl &draw_times, f32 dtime);
+	void updateProfilerGraphs(ProfilerGraph *graph);
+
+	// Input related
+	void processUserInput(f32 dtime);
+	void processKeyInput();
+	void processItemSelection(u16 *new_playeritem);
+
+	void dropSelectedItem(bool single_item = false);
+	void openInventory();
+	void openConsole(float scale, const wchar_t *line=NULL);
+	void toggleFreeMove();
+	void toggleFreeMoveAlt();
+	void togglePitchMove();
+	void toggleFast();
+	void toggleNoClip();
+	void toggleCinematic();
+	void toggleBlockBounds();
+	void toggleAutoforward();
+
+	void toggleMinimap(bool shift_pressed);
+	void toggleFog();
+	void toggleDebug();
+	void toggleUpdateCamera();
+
+	void increaseViewRange();
+	void decreaseViewRange();
+	void toggleFullViewRange();
+	void checkZoomEnabled();
+
+	void updateCameraDirection(CameraOrientation *cam, float dtime);
+	void updateCameraOrientation(CameraOrientation *cam, float dtime);
+	void updatePlayerControl(const CameraOrientation &cam);
+	void updatePauseState();
+	void step(f32 dtime);
+	void processClientEvents(CameraOrientation *cam);
+	void updateCamera(f32 dtime);
+	void updateSound(f32 dtime);
+	void processPlayerInteraction(f32 dtime, bool show_hud);
+	/*!
+	 * Returns the object or node the player is pointing at.
+	 * Also updates the selected thing in the Hud.
+	 *
+	 * @param[in]  shootline         the shootline, starting from
+	 * the camera position. This also gives the maximal distance
+	 * of the search.
+	 * @param[in]  liquids_pointable if false, liquids are ignored
+	 * @param[in]  pointabilities    item specific pointable overriding
+	 * @param[in]  look_for_object   if false, objects are ignored
+	 * @param[in]  camera_offset     offset of the camera
+	 * @param[out] selected_object   the selected object or
+	 * NULL if not found
+	 */
+	PointedThing updatePointedThing(
+			const core::line3d<f32> &shootline, bool liquids_pointable,
+			const std::optional<Pointabilities> &pointabilities,
+			bool look_for_object, const v3s16 &camera_offset);
+	void handlePointingAtNothing(const ItemStack &playerItem);
+	void handlePointingAtNode(const PointedThing &pointed,
+			const ItemStack &selected_item, const ItemStack &hand_item, f32 dtime);
+	void handlePointingAtObject(const PointedThing &pointed, const ItemStack &playeritem,
+			const v3f &player_position, bool show_debug);
+	void handleDigging(const PointedThing &pointed, const v3s16 &nodepos,
+			const ItemStack &selected_item, const ItemStack &hand_item, f32 dtime);
+	void updateFrame(ProfilerGraph *graph, RunStats *stats, f32 dtime,
+			const CameraOrientation &cam);
+	void updateClouds(float dtime);
+	void updateShadows();
+	void drawScene(ProfilerGraph *graph, RunStats *stats);
+
+	// Misc
+	void showOverlayMessage(const char *msg, float dtime, int percent,
+			float *indef_pos = nullptr);
+
+	inline bool fogEnabled()
+	{
+		// Client setting only takes effect if fog distance unlimited or debug priv
+		if (sky->getFogDistance() < 0 || client->checkPrivilege("debug"))
+			return m_cache_enable_fog;
+		return true;
+	}
+
+	static void settingChangedCallback(const std::string &setting_name, void *data);
+	void readSettings();
+
+	inline bool isKeyDown(GameKeyType k)
+	{
+		return input->isKeyDown(k);
+	}
+	inline bool wasKeyDown(GameKeyType k)
+	{
+		return input->wasKeyDown(k);
+	}
+	inline bool wasKeyPressed(GameKeyType k)
+	{
+		return input->wasKeyPressed(k);
+	}
+	inline bool wasKeyReleased(GameKeyType k)
+	{
+		return input->wasKeyReleased(k);
+	}
+
+#ifdef __ANDROID__
+	void handleAndroidChatInput();
+#endif
+
+private:
+	struct Flags {
+		bool disable_camera_update = false;
+	};
+
+	void showDeathFormspec();
+	void showPauseMenu();
+
+	void pauseAnimation();
+	void resumeAnimation();
+
+	// ClientEvent handlers
+	void handleClientEvent_None(ClientEvent *event, CameraOrientation *cam);
+	void handleClientEvent_PlayerDamage(ClientEvent *event, CameraOrientation *cam);
+	void handleClientEvent_PlayerForceMove(ClientEvent *event, CameraOrientation *cam);
+	void handleClientEvent_Deathscreen(ClientEvent *event, CameraOrientation *cam);
+	void handleClientEvent_ShowFormSpec(ClientEvent *event, CameraOrientation *cam);
+	void handleClientEvent_ShowLocalFormSpec(ClientEvent *event, CameraOrientation *cam);
+	void handleClientEvent_HandleParticleEvent(ClientEvent *event,
+		CameraOrientation *cam);
+	void handleClientEvent_HudAdd(ClientEvent *event, CameraOrientation *cam);
+	void handleClientEvent_HudRemove(ClientEvent *event, CameraOrientation *cam);
+	void handleClientEvent_HudChange(ClientEvent *event, CameraOrientation *cam);
+	void handleClientEvent_SetSky(ClientEvent *event, CameraOrientation *cam);
+	void handleClientEvent_SetSun(ClientEvent *event, CameraOrientation *cam);
+	void handleClientEvent_SetMoon(ClientEvent *event, CameraOrientation *cam);
+	void handleClientEvent_SetStars(ClientEvent *event, CameraOrientation *cam);
+	void handleClientEvent_OverrideDayNigthRatio(ClientEvent *event,
+		CameraOrientation *cam);
+	void handleClientEvent_CloudParams(ClientEvent *event, CameraOrientation *cam);
+
+	void updateChat(f32 dtime);
+
+	bool nodePlacement(const ItemDefinition &selected_def, const ItemStack &selected_item,
+		const v3s16 &nodepos, const v3s16 &neighborpos, const PointedThing &pointed,
+		const NodeMetadata *meta);
+	static const ClientEventHandler clientEventHandler[CLIENTEVENT_MAX];
+
+	f32 getSensitivityScaleFactor() const;
+
+	InputHandler *input = nullptr;
+
+	Client *client = nullptr;
+	Server *server = nullptr;
+
+	ClientDynamicInfo client_display_info{};
+	float dynamic_info_send_timer = 0;
+
+	IWritableTextureSource *texture_src = nullptr;
+	IWritableShaderSource *shader_src = nullptr;
+
+	// When created, these will be filled with data received from the server
+	IWritableItemDefManager *itemdef_manager = nullptr;
+	NodeDefManager *nodedef_manager = nullptr;
+
+	std::unique_ptr<ISoundManager> sound_manager;
+	SoundMaker *soundmaker = nullptr;
+
+	ChatBackend *chat_backend = nullptr;
+	LogOutputBuffer m_chat_log_buf;
+
+	EventManager *eventmgr = nullptr;
+	QuicktuneShortcutter *quicktune = nullptr;
+
+	std::unique_ptr<GameUI> m_game_ui;
+	GUIChatConsole *gui_chat_console = nullptr; // Free using ->Drop()
+	MapDrawControl *draw_control = nullptr;
+	Camera *camera = nullptr;
+	Clouds *clouds = nullptr;	                  // Free using ->Drop()
+	Sky *sky = nullptr;                         // Free using ->Drop()
+	Hud *hud = nullptr;
+	Minimap *mapper = nullptr;
+
+	// Map server hud ids to client hud ids
+	std::unordered_map<u32, u32> m_hud_server_to_client;
+
+	GameRunData runData;
+	Flags m_flags;
+
+	/* 'cache'
+	   This class does take ownership/responsibily for cleaning up etc of any of
+	   these items (e.g. device)
+	*/
+	IrrlichtDevice *device;
+	RenderingEngine *m_rendering_engine;
+	video::IVideoDriver *driver;
+	scene::ISceneManager *smgr;
+	bool *kill;
+	std::string *error_message;
+	bool *reconnect_requested;
+	PausedNodesList paused_animated_nodes;
+
+	bool simple_singleplayer_mode;
+	/* End 'cache' */
+
+	/* Pre-calculated values
+	 */
+	int crack_animation_length;
+
+	IntervalLimiter profiler_interval;
+
+	/*
+	 * TODO: Local caching of settings is not optimal and should at some stage
+	 *       be updated to use a global settings object for getting thse values
+	 *       (as opposed to the this local caching). This can be addressed in
+	 *       a later release.
+	 */
+	bool m_cache_doubletap_jump;
+	bool m_cache_enable_clouds;
+	bool m_cache_enable_joysticks;
+	bool m_cache_enable_particles;
+	bool m_cache_enable_fog;
+	bool m_cache_enable_noclip;
+	bool m_cache_enable_free_move;
+	f32  m_cache_mouse_sensitivity;
+	f32  m_cache_joystick_frustum_sensitivity;
+	f32  m_repeat_place_time;
+	f32  m_repeat_dig_time;
+	f32  m_cache_cam_smoothing;
+
+	bool m_invert_mouse;
+	bool m_enable_hotbar_mouse_wheel;
+	bool m_invert_hotbar_mouse_wheel;
+
+	bool m_first_loop_after_window_activation = false;
+	bool m_camera_offset_changed = false;
+	bool m_game_focused = false;
+
+	bool m_does_lost_focus_pause_game = false;
+
+	// if true, (almost) the whole game is paused
+	// this happens in pause menu in singleplayer
+	bool m_is_paused = false;
+
+	bool m_touch_simulate_aux1 = false;
+	bool m_touch_use_crosshair;
+	inline bool isTouchCrosshairDisabled() {
+		return !m_touch_use_crosshair && camera->getCameraMode() == CAMERA_MODE_FIRST;
+	}
+#ifdef __ANDROID__
+	bool m_android_chat_open;
+#endif
+
+	float m_shutdown_progress = 0.0f;
+};
 
 Game::Game() :
 	m_chat_log_buf(g_logger),
 	m_game_ui(new GameUI())
 {
-	clearTextureNameCache();
-
-	const char *settings[] = {
-		"chat_log_level", "doubletap_jump", "toggle_sneak_key", "toggle_aux1_key",
-		"enable_fog", "mouse_sensitivity",
-		"repeat_place_time", "repeat_dig_time", "noclip", "free_move", "fog_start",
-		"cinematic", "cinematic_camera_smoothing", "camera_smoothing", "invert_mouse",
-		"enable_hotbar_mouse_wheel", "invert_hotbar_mouse_wheel", "pause_on_lost_focus",
-	};
-	for (auto s : settings)
-		g_settings->registerChangedCallback(s, &settingChangedCallback, this);
+	g_settings->registerChangedCallback("doubletap_jump",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("enable_clouds",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("enable_joysticks",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("enable_particles",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("enable_fog",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("mouse_sensitivity",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("joystick_frustum_sensitivity",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("repeat_place_time",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("repeat_dig_time",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("noclip",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("free_move",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("fog_start",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("cinematic",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("cinematic_camera_smoothing",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("camera_smoothing",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("invert_mouse",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("enable_hotbar_mouse_wheel",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("invert_hotbar_mouse_wheel",
+		&settingChangedCallback, this);
+	g_settings->registerChangedCallback("pause_on_lost_focus",
+		&settingChangedCallback, this);
 
 	readSettings();
 }
 
 
+
+/****************************************************************************
+ MinetestApp Public
+ ****************************************************************************/
+
 Game::~Game()
 {
 	delete client;
-	soundmaker.reset();
+	delete soundmaker;
 	sound_manager.reset();
 
 	delete server;
@@ -412,17 +1042,54 @@ Game::~Game()
 
 	clearTextureNameCache();
 
-	g_settings->deregisterAllChangedCallbacks(this);
-
+	g_settings->deregisterChangedCallback("doubletap_jump",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("enable_clouds",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("enable_joysticks",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("enable_particles",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("enable_fog",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("mouse_sensitivity",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("joystick_frustum_sensitivity",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("repeat_place_time",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("repeat_dig_time",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("noclip",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("free_move",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("fog_start",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("cinematic",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("cinematic_camera_smoothing",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("camera_smoothing",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("invert_mouse",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("enable_hotbar_mouse_wheel",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("invert_hotbar_mouse_wheel",
+		&settingChangedCallback, this);
+	g_settings->deregisterChangedCallback("pause_on_lost_focus",
+		&settingChangedCallback, this);
 	if (m_rendering_engine)
 		m_rendering_engine->finalize();
 }
 
-bool Game::startup(volatile std::sig_atomic_t *kill,
+bool Game::startup(bool *kill,
 		InputHandler *input,
 		RenderingEngine *rendering_engine,
-		GameStartData &start_data,
-		GameErrorData &errordata,
+		const GameStartData &start_data,
+		std::string &error_message,
+		bool *reconnect,
 		ChatBackend *chat_backend)
 {
 
@@ -430,33 +1097,36 @@ bool Game::startup(volatile std::sig_atomic_t *kill,
 	m_rendering_engine        = rendering_engine;
 	device                    = m_rendering_engine->get_raw_device();
 	this->kill                = kill;
-	this->errordata           = &errordata;
+	this->error_message       = &error_message;
+	reconnect_requested       = reconnect;
 	this->input               = input;
 	this->chat_backend        = chat_backend;
 	simple_singleplayer_mode  = start_data.isSinglePlayer();
 
-	input->reloadKeybindings();
+	input->keycache.populate();
 
 	driver = device->getVideoDriver();
 	smgr = m_rendering_engine->get_scene_manager();
 
 	driver->setTextureCreationFlag(video::ETCF_CREATE_MIP_MAPS, g_settings->getBool("mip_map"));
 
+	smgr->getParameters()->setAttribute(scene::OBJ_LOADER_IGNORE_MATERIAL_FILES, true);
+
 	// Reinit runData
 	runData = GameRunData();
 	runData.time_from_last_punch = 10.0;
 
 	m_game_ui->initFlags();
-	if (g_settings->getBool("show_debug")) {
-		m_flags.debug_state = 1;
-		m_game_ui->m_flags.show_minimal_debug = true;
-	}
 
 	m_first_loop_after_window_activation = true;
 
+	m_touch_use_crosshair = g_settings->getBool("touch_use_crosshair");
+
 	g_client_translations->clear();
 
-	if (!init(start_data))
+	// address can change if simple_singleplayer_mode
+	if (!init(start_data.world_spec.path, start_data.address,
+			start_data.socket_port, start_data.game_spec))
 		return false;
 
 	if (!createClient(start_data))
@@ -464,16 +1134,12 @@ bool Game::startup(volatile std::sig_atomic_t *kill,
 
 	m_rendering_engine->initialize(client, hud);
 
-	m_game_formspec.init(client, m_rendering_engine, input);
-
 	return true;
 }
 
 
 void Game::run()
 {
-	ZoneScoped;
-
 	ProfilerGraph graph;
 	RunStats stats = {};
 	CameraOrientation cam_view_target = {};
@@ -489,36 +1155,26 @@ void Game::run()
 
 	draw_times.reset();
 
+	set_light_table(g_settings->getFloat("display_gamma"));
+
 	m_touch_simulate_aux1 = g_settings->getBool("fast_move")
 			&& client->checkPrivilege("fast");
 
-	const core::dimension2du initial_screen_size(
+	const irr::core::dimension2du initial_screen_size(
 			g_settings->getU16("screen_w"),
 			g_settings->getU16("screen_h")
 		);
 	const bool initial_window_maximized = !g_settings->getBool("fullscreen") &&
 			g_settings->getBool("window_maximized");
 
-#ifdef __ANDROID__
-	porting::setPlayingNowNotification(true);
-#endif
-
-	auto framemarker = FrameMarker("Game::run()-frame").started();
-
 	while (m_rendering_engine->run()
 			&& !(*kill || g_gamecallback->shutdown_requested
 			|| (server && server->isShutdownRequested()))) {
 
-		framemarker.end();
-
 		// Calculate dtime =
 		//    m_rendering_engine->run() from this iteration
 		//  + Sleep time until the wanted FPS are reached
-		draw_times.limit(device, &dtime);
-
-		framemarker.start();
-
-		g_fontengine->handleReload();
+		draw_times.limit(device, &dtime, g_menumgr.pausesGame());
 
 		const auto current_dynamic_info = ClientDynamicInfo::getCurrent();
 		if (!current_dynamic_info.equal(client_display_info)) {
@@ -540,7 +1196,7 @@ void Game::run()
 
 		if (!checkConnection())
 			break;
-		if (!m_game_formspec.handleCallbacks())
+		if (!handleCallbacks())
 			break;
 
 		processQueues();
@@ -548,31 +1204,13 @@ void Game::run()
 		m_game_ui->clearInfoText();
 
 		updateProfilers(stats, draw_times, dtime);
-
-		// Update camera offset once before doing anything.
-		// In contrast to other updates the latency of this doesn't matter,
-		// since it's invisible to the user. But it needs to be consistent.
-		updateCameraOffset();
-
 		processUserInput(dtime);
 		// Update camera before player movement to avoid camera lag of one frame
 		updateCameraDirection(&cam_view_target, dtime);
-		if (m_cache_cam_smoothing <= 0.0f) {
-			cam_view.camera_yaw = cam_view_target.camera_yaw;
-			cam_view.camera_pitch = cam_view_target.camera_pitch;
-		} else {
-			f32 cam_damp_lambda = 1.0f / m_cache_cam_smoothing * dtime;
-			cam_view.camera_yaw = damp(
-					cam_view.camera_yaw,
-					cam_view_target.camera_yaw,
-					cam_damp_lambda
-			);
-			cam_view.camera_pitch = damp(
-					cam_view.camera_pitch,
-					cam_view_target.camera_pitch,
-					cam_damp_lambda
-			);
-		}
+		cam_view.camera_yaw += (cam_view_target.camera_yaw -
+				cam_view.camera_yaw) * m_cache_cam_smoothing;
+		cam_view.camera_pitch += (cam_view_target.camera_pitch -
+				cam_view.camera_pitch) * m_cache_cam_smoothing;
 		updatePlayerControl(cam_view);
 
 		updatePauseState();
@@ -583,7 +1221,6 @@ void Game::run()
 
 		processClientEvents(&cam_view_target);
 		updateDebugState();
-		// Update camera here so it is in-sync with CAO position
 		updateCamera(dtime);
 		updateSound(dtime);
 		processPlayerInteraction(dtime, m_game_ui->m_flags.show_hud);
@@ -591,15 +1228,9 @@ void Game::run()
 		updateProfilerGraphs(&graph);
 
 		if (m_does_lost_focus_pause_game && !device->isWindowFocused() && !isMenuActive()) {
-			m_game_formspec.showPauseMenu();
+			showPauseMenu();
 		}
 	}
-
-	framemarker.end();
-
-#ifdef __ANDROID__
-	porting::setPlayingNowNotification(false);
-#endif
 
 	RenderingEngine::autosaveScreensizeAndCo(initial_screen_size, initial_window_maximized);
 }
@@ -607,35 +1238,40 @@ void Game::run()
 
 void Game::shutdown()
 {
-	// Delete text and menus first
+	auto formspec = m_game_ui->getFormspecGUI();
+	if (formspec)
+		formspec->quitMenu();
+
+	// Clear text when exiting.
 	m_game_ui->clearText();
-	m_game_formspec.reset();
-	while (g_menumgr.menuCount() > 0) {
-		g_menumgr.deleteFront();
-	}
 
-	if (g_touchcontrols)
-		g_touchcontrols->hide();
-
-	// Restore normal mouse cursor
-	auto *cur_control = device->getCursorControl();
-	if (cur_control) {
-		cur_control->setVisible(true);
-		cur_control->setRelativeMode(false);
-	}
-
-	clouds.reset();
-
-	gui_chat_console.reset();
-
-	sky.reset();
+	if (g_touchscreengui)
+		g_touchscreengui->hide();
 
 	// only if the shutdown progress bar isn't shown yet
 	if (m_shutdown_progress == 0.0f)
 		showOverlayMessage(N_("Shutting down..."), 0, 0);
 
+	if (clouds)
+		clouds->drop();
+
+	if (gui_chat_console)
+		gui_chat_console->drop();
+
+	if (sky)
+		sky->drop();
+
+	/* cleanup menus */
+	while (g_menumgr.menuCount() > 0) {
+		g_menumgr.m_stack.front()->setVisible(false);
+		g_menumgr.deletingMenu(g_menumgr.m_stack.front());
+	}
+
+	m_game_ui->deleteFormspec();
+
 	chat_backend->addMessage(L"", L"# Disconnected.");
 	chat_backend->addMessage(L"", L"");
+	m_chat_log_buf.clear();
 
 	if (client) {
 		client->Stop();
@@ -650,7 +1286,8 @@ void Game::shutdown()
 
 	delete client;
 	client = nullptr;
-	soundmaker.reset();
+	delete soundmaker;
+	soundmaker = nullptr;
 	sound_manager.reset();
 
 	auto stop_thread = runInThread([=] {
@@ -680,7 +1317,11 @@ void Game::shutdown()
  ****************************************************************************/
 /****************************************************************************/
 
-bool Game::init(GameStartData &start_data)
+bool Game::init(
+		const std::string &map_dir,
+		const std::string &address,
+		u16 port,
+		const SubgameSpec &gamespec)
 {
 	texture_src = createTextureSource();
 
@@ -690,8 +1331,6 @@ bool Game::init(GameStartData &start_data)
 
 	itemdef_manager = createItemDefManager();
 	nodedef_manager = createNodeDefManager();
-
-	m_item_visuals_manager = std::make_unique<ItemVisualsManager>();
 
 	eventmgr = new EventManager();
 	quicktune = new QuicktuneShortcutter();
@@ -704,8 +1343,8 @@ bool Game::init(GameStartData &start_data)
 		return false;
 
 	// Create a server if not connecting to an existing one
-	if (start_data.address.empty()) {
-		if (!createServer(start_data))
+	if (address.empty()) {
+		if (!createSingleplayerServer(map_dir, gamespec, port))
 			return false;
 	}
 
@@ -715,7 +1354,7 @@ bool Game::init(GameStartData &start_data)
 bool Game::initSound()
 {
 #if USE_SOUND
-	if (g_sound_manager_singleton.get()) {
+	if (g_settings->getBool("enable_sound") && g_sound_manager_singleton.get()) {
 		infostream << "Attempting to use OpenAL audio" << std::endl;
 		sound_manager = createOpenALSoundManager(g_sound_manager_singleton.get(),
 				std::make_unique<SoundFallbackPathProvider>());
@@ -731,13 +1370,17 @@ bool Game::initSound()
 		sound_manager = std::make_unique<DummySoundManager>();
 	}
 
-	soundmaker = std::make_unique<SoundMaker>(sound_manager.get(), nodedef_manager);
+	soundmaker = new SoundMaker(sound_manager.get(), nodedef_manager);
+	if (!soundmaker)
+		return false;
+
 	soundmaker->registerReceiver(eventmgr);
 
 	return true;
 }
 
-bool Game::createServer(GameStartData &start_data)
+bool Game::createSingleplayerServer(const std::string &map_dir,
+		const SubgameSpec &gamespec, u16 port)
 {
 	showOverlayMessage(N_("Creating server..."), 0, 5);
 
@@ -750,7 +1393,7 @@ bool Game::createServer(GameStartData &start_data)
 		bind_str = g_settings->get("bind_address");
 	}
 
-	Address bind_addr(0, 0, 0, 0, start_data.socket_port);
+	Address bind_addr(0, 0, 0, 0, port);
 
 	if (g_settings->getBool("ipv6_server"))
 		bind_addr.setAddress(static_cast<IPv6AddressBytes*>(nullptr));
@@ -762,18 +1405,14 @@ bool Game::createServer(GameStartData &start_data)
 			<< " -- Listening on all addresses." << std::endl;
 	}
 	if (bind_addr.isIPv6() && !g_settings->getBool("enable_ipv6")) {
-		errordata->setError(fmtgettext("Unable to listen on %s because IPv6 is disabled",
-			bind_addr.serializeString().c_str()));
+		*error_message = fmtgettext("Unable to listen on %s because IPv6 is disabled",
+			bind_addr.serializeString().c_str());
+		errorstream << *error_message << std::endl;
 		return false;
 	}
 
-	UDPSocket server_socket = UDPSocket::Create(bind_addr);
-	// in singleplayer mode the OS assigns us the port in bind
-	start_data.socket_port = server_socket.GetLocalAddress().getPort();
-
-	server = new Server(start_data.world_spec.path, start_data.game_spec,
-		simple_singleplayer_mode, std::move(server_socket),
-		false, nullptr, &(errordata->message));
+	server = new Server(map_dir, gamespec, simple_singleplayer_mode, bind_addr,
+			false, nullptr, error_message);
 
 	auto start_thread = runInThread([=] {
 		server->start();
@@ -807,7 +1446,7 @@ void Game::copyServerClientCache()
 {
 	// It would be possible to let the client directly read the media files
 	// from where the server knows they are. But aside from being more complicated
-	// it would also *not* fill the media cache and cause slower joining of
+	// it would also *not* fill the media cache and cause slower joining of 
 	// remote servers.
 	// (Imagine that you launch a game once locally and then connect to a server.)
 
@@ -825,8 +1464,6 @@ void Game::copyServerClientCache()
 
 bool Game::createClient(const GameStartData &start_data)
 {
-	std::string *error_message = &(errordata->message);
-
 	showOverlayMessage(N_("Creating client..."), 0, 10);
 
 	draw_control = new MapDrawControl();
@@ -840,7 +1477,8 @@ bool Game::createClient(const GameStartData &start_data)
 	if (!could_connect) {
 		if (error_message->empty() && !connect_aborted) {
 			// Should not happen if error messages are set properly
-			errordata->setError(gettext("Connection failed for unknown reason"));
+			*error_message = gettext("Connection failed for unknown reason");
+			errorstream << *error_message << std::endl;
 		}
 		return false;
 	}
@@ -848,36 +1486,22 @@ bool Game::createClient(const GameStartData &start_data)
 	if (!getServerContent(&connect_aborted)) {
 		if (error_message->empty() && !connect_aborted) {
 			// Should not happen if error messages are set properly
-			errordata->setError(gettext("Connection failed for unknown reason"));
+			*error_message = gettext("Connection failed for unknown reason");
+			errorstream << *error_message << std::endl;
 		}
 		return false;
 	}
 
-	// Pre-calculate crack length
-	{
-		auto size = texture_src->getTextureDimensions("crack_anylength.png");
-		if (size.Width && size.Height)
-			crack_animation_length = size.Height / size.Width;
-		else
-			crack_animation_length = 5;
-	}
+	auto *scsf = new GameGlobalShaderConstantSetterFactory(client);
+	shader_src->addShaderConstantSetterFactory(scsf);
 
-	shader_src->addShaderConstantSetter(
-		std::make_unique<NodeShaderConstantSetter>());
-
-	auto scsf_up = std::make_unique<GameGlobalShaderUniformSetterFactory>(this);
-	auto* scsf = scsf_up.get();
-	shader_src->addShaderUniformSetterFactory(std::move(scsf_up));
-
-	shader_src->addShaderUniformSetterFactory(
-		std::make_unique<FogShaderUniformSetterFactory>());
+	shader_src->addShaderConstantSetterFactory(
+		new FogShaderConstantSetterFactory());
 
 	ShadowRenderer::preInit(shader_src);
 
 	// Update cached textures, meshes and materials
 	client->afterContentReceived();
-	// Load received SSCSMs
-	client->loadSSCSM();
 
 	/* Camera
 	 */
@@ -886,14 +1510,29 @@ bool Game::createClient(const GameStartData &start_data)
 		client->getScript()->on_camera_ready(camera);
 	client->setCamera(camera);
 
+	if (g_touchscreengui) {
+		g_touchscreengui->setUseCrosshair(!isTouchCrosshairDisabled());
+	}
+
 	/* Clouds
 	 */
-	clouds = make_irr<Clouds>(smgr, shader_src, -1, myrand());
+	if (m_cache_enable_clouds)
+		clouds = new Clouds(smgr, shader_src, -1, rand());
 
 	/* Skybox
 	 */
-	sky = make_irr<Sky>(-1, m_rendering_engine, texture_src, shader_src);
-	scsf->setSky(sky.get());
+	sky = new Sky(-1, m_rendering_engine, texture_src, shader_src);
+	scsf->setSky(sky);
+
+	/* Pre-calculated values
+	 */
+	video::ITexture *t = texture_src->getTexture("crack_anylength.png");
+	if (t) {
+		v2u32 size = t->getOriginalSize();
+		crack_animation_length = size.Y / size.X;
+	} else {
+		crack_animation_length = 5;
+	}
 
 	if (!initGui())
 		return false;
@@ -925,17 +1564,6 @@ bool Game::createClient(const GameStartData &start_data)
 	return true;
 }
 
-bool Game::shouldShowTouchControls()
-{
-	if (!device->supportsTouchEvents())
-		return false;
-
-	const std::string &touch_controls = g_settings->get("touch_controls");
-	if (touch_controls == "auto")
-		return RenderingEngine::getLastPointerType() == PointerType::Touch;
-	return is_yes(touch_controls);
-}
-
 bool Game::initGui()
 {
 	m_game_ui->init();
@@ -947,11 +1575,11 @@ bool Game::initGui()
 	chat_backend->applySettings();
 
 	// Chat backend and console
-	gui_chat_console = make_irr<GUIChatConsole>(guienv, guienv->getRootGUIElement(),
+	gui_chat_console = new GUIChatConsole(guienv, guienv->getRootGUIElement(),
 			-1, chat_backend, client, &g_menumgr);
 
-	if (shouldShowTouchControls())
-		g_touchcontrols = new TouchControls(device, texture_src);
+	if (g_settings->getBool("enable_touch"))
+		g_touchscreengui = new TouchScreenGUI(device, texture_src);
 
 	return true;
 }
@@ -959,10 +1587,9 @@ bool Game::initGui()
 bool Game::connectToServer(const GameStartData &start_data,
 		bool *connect_ok, bool *connection_aborted)
 {
-	std::string *error_message = &(errordata->message);
-
 	*connect_ok = false;	// Let's not be overly optimistic
 	*connection_aborted = false;
+	bool local_server_mode = false;
 	const auto &address_name = start_data.address;
 
 	showOverlayMessage(N_("Resolving address..."), 0, 15);
@@ -982,6 +1609,7 @@ bool Game::connectToServer(const GameStartData &start_data,
 			} else {
 				connect_address.setAddress(127, 0, 0, 1);
 			}
+			local_server_mode = true;
 		}
 	} catch (ResolveError &e) {
 		*error_message = fmtgettext("Couldn't resolve address: %s", e.what());
@@ -1017,8 +1645,7 @@ bool Game::connectToServer(const GameStartData &start_data,
 				start_data.password,
 				*draw_control, texture_src, shader_src,
 				itemdef_manager, nodedef_manager, sound_manager.get(), eventmgr,
-				m_rendering_engine,
-				m_item_visuals_manager.get(),
+				m_rendering_engine, m_game_ui.get(),
 				start_data.allow_login_or_register);
 	} catch (const BaseException &e) {
 		*error_message = fmtgettext("Error creating client: %s", e.what());
@@ -1028,13 +1655,13 @@ bool Game::connectToServer(const GameStartData &start_data,
 
 	client->migrateModStorage();
 	client->m_simple_singleplayer_mode = simple_singleplayer_mode;
-	client->m_internal_server = !!server;
 
 	/*
 		Wait for server to accept connection
 	*/
 
-	client->connect(connect_address, address_name);
+	client->connect(connect_address, address_name,
+		simple_singleplayer_mode || local_server_mode);
 
 	try {
 		input->clear();
@@ -1046,13 +1673,9 @@ bool Game::connectToServer(const GameStartData &start_data,
 
 		fps_control.reset();
 
-		auto framemarker = FrameMarker("Game::connectToServer()-frame").started();
-
 		while (m_rendering_engine->run()) {
 
-			framemarker.end();
 			fps_control.limit(device, &dtime);
-			framemarker.start();
 
 			// Update client and server
 			step(dtime);
@@ -1067,8 +1690,12 @@ bool Game::connectToServer(const GameStartData &start_data,
 			if (*connection_aborted)
 				break;
 
-			if (!checkConnection())
+			if (client->accessDenied()) {
+				*error_message = fmtgettext("Access denied. Reason: %s", client->accessDeniedReason().c_str());
+				*reconnect_requested = client->reconnectRequested();
+				errorstream << *error_message << std::endl;
 				break;
+			}
 
 			if (input->cancelPressed()) {
 				*connection_aborted = true;
@@ -1077,11 +1704,12 @@ bool Game::connectToServer(const GameStartData &start_data,
 			}
 
 			wait_time += dtime;
-			if (server) {
+			if (local_server_mode) {
 				// never time out
 			} else if (wait_time > GAME_FALLBACK_TIMEOUT && !did_fallback) {
 				if (!client->hasServerReplied() && fallback_address.isValid()) {
-					client->connect(fallback_address, address_name);
+					client->connect(fallback_address, address_name,
+						simple_singleplayer_mode || local_server_mode);
 				}
 				did_fallback = true;
 			} else if (wait_time > GAME_CONNECTION_TIMEOUT) {
@@ -1093,7 +1721,6 @@ bool Game::connectToServer(const GameStartData &start_data,
 			// Update status
 			showOverlayMessage(N_("Connecting to server..."), dtime, 20);
 		}
-		framemarker.end();
 	} catch (con::PeerNotFoundException &e) {
 		warningstream << "This should not happen. Please report a bug." << std::endl;
 		return false;
@@ -1111,11 +1738,9 @@ bool Game::getServerContent(bool *aborted)
 
 	fps_control.reset();
 
-	auto framemarker = FrameMarker("Game::getServerContent()-frame").started();
 	while (m_rendering_engine->run()) {
-		framemarker.end();
+
 		fps_control.limit(device, &dtime);
-		framemarker.start();
 
 		// Update client and server
 		step(dtime);
@@ -1131,8 +1756,8 @@ bool Game::getServerContent(bool *aborted)
 			return false;
 
 		if (client->getState() < LC_Init) {
-			errordata->message = gettext("Client disconnected");
-			errorstream << errordata->message << std::endl;
+			*error_message = gettext("Client disconnected");
+			errorstream << *error_message << std::endl;
 			return false;
 		}
 
@@ -1141,13 +1766,6 @@ bool Game::getServerContent(bool *aborted)
 			infostream << "Connect aborted [Escape]" << std::endl;
 			return false;
 		}
-
-		const char* units[] = {gettext("KiB"), gettext("MiB")};
-		auto adjust_unit = [&units](float &v) -> const char* {
-			int i = (v > 900) ? 1 : 0;
-			v /= (i == 1) ? 1024.0f : 1.0f;
-			return units[i];
-		};
 
 		// Display status
 		int progress = 25;
@@ -1163,31 +1781,31 @@ bool Game::getServerContent(bool *aborted)
 		} else {
 			std::ostringstream message;
 			std::fixed(message);
-			std::string sub_message;
+			message.precision(0);
+			float receive = client->mediaReceiveProgress() * 100;
 			message << gettext("Media...");
-			float received_ratio = 0.f;
-			s32 received = 0, total = 0;
-			size_t received_size = 0;
-			if (client->mediaReceiveProgress(received, total, received_size)) {
-				if (total > 0)
-					received_ratio = ((float) received) / total;
+			if (receive > 0)
+				message << " " << receive << "%";
+			message.precision(2);
 
-				message.precision(0);
-				message << " " << received_ratio * 100.f << "%";
+			if ((USE_CURL == 0) ||
+					(!g_settings->getBool("enable_remote_media_server"))) {
+				float cur = client->getCurRate();
+				std::string cur_unit = gettext("KiB/s");
 
-				float adjusted_size = ((float) received_size) / 1024.0f;
-				auto unit = adjust_unit(adjusted_size);
-				sub_message = fmtgettext("Files: %d / %d", received, total) + "\n"
-							+ fmtgettext("Size: %.2f %s", adjusted_size, unit);
+				if (cur > 900) {
+					cur /= 1024.0;
+					cur_unit = gettext("MiB/s");
+				}
+
+				message << " (" << cur << ' ' << cur_unit << ")";
 			}
 
-			// 30% -> 65%
-			progress = 30 + std::ceil(received_ratio * 35 + 0.5f);
+			progress = 30 + client->mediaReceiveProgress() * 35 + 0.5;
 			m_rendering_engine->draw_load_screen(utf8_to_wide(message.str()), guienv,
-					texture_src, dtime, progress, nullptr, utf8_to_wide(sub_message));
+				texture_src, dtime, progress);
 		}
 	}
-	framemarker.end();
 
 	*aborted = true;
 	infostream << "Connect aborted [device]" << std::endl;
@@ -1215,22 +1833,60 @@ inline void Game::updateInteractTimers(f32 dtime)
 
 /* returns false if game should exit, otherwise true
  */
-bool Game::checkConnection()
+inline bool Game::checkConnection()
 {
 	if (client->accessDenied()) {
-		// May be mod-provided, thus may contain color and translation
-		const std::string reason = wide_to_utf8(
-			unescape_translate(utf8_to_wide(client->accessDeniedReason())));
-
-		errordata->setError(
-			fmtgettext("Access denied. Reason: %s", reason.c_str()),
-			client->reconnectRequested()
-		);
+		*error_message = fmtgettext("Access denied. Reason: %s", client->accessDeniedReason().c_str());
+		*reconnect_requested = client->reconnectRequested();
+		errorstream << *error_message << std::endl;
 		return false;
 	}
 
 	return true;
 }
+
+
+/* returns false if game should exit, otherwise true
+ */
+inline bool Game::handleCallbacks()
+{
+	if (g_gamecallback->disconnect_requested) {
+		g_gamecallback->disconnect_requested = false;
+		return false;
+	}
+
+	if (g_gamecallback->changepassword_requested) {
+		(new GUIPasswordChange(guienv, guiroot, -1,
+				       &g_menumgr, client, texture_src))->drop();
+		g_gamecallback->changepassword_requested = false;
+	}
+
+	if (g_gamecallback->changevolume_requested) {
+		(new GUIVolumeChange(guienv, guiroot, -1,
+				     &g_menumgr, texture_src))->drop();
+		g_gamecallback->changevolume_requested = false;
+	}
+
+	if (g_gamecallback->keyconfig_requested) {
+		(new GUIKeyChangeMenu(guienv, guiroot, -1,
+				      &g_menumgr, texture_src))->drop();
+		g_gamecallback->keyconfig_requested = false;
+	}
+
+	if (!g_gamecallback->show_open_url_dialog.empty()) {
+		(new GUIOpenURLMenu(guienv, guiroot, -1,
+				 &g_menumgr, texture_src, g_gamecallback->show_open_url_dialog))->drop();
+		g_gamecallback->show_open_url_dialog.clear();
+	}
+
+	if (g_gamecallback->keyconfig_changed) {
+		input->keycache.populate(); // update the cache with new settings
+		g_gamecallback->keyconfig_changed = false;
+	}
+
+	return true;
+}
+
 
 void Game::processQueues()
 {
@@ -1257,9 +1913,11 @@ void Game::updateDebugState()
 		hud->disableBlockBounds();
 	if (!has_debug) {
 		draw_control->show_wireframe = false;
-		smgr->setGlobalDebugData(0, bbox_debug_flag);
 		m_flags.disable_camera_update = false;
-		m_game_formspec.disableDebugView();
+		auto formspec = m_game_ui->getFormspecGUI();
+		if (formspec) {
+			formspec->setDebugView(false);
+		}
 	}
 
 	// noclip
@@ -1279,26 +1937,6 @@ void Game::updateProfilers(const RunStats &stats, const FpsControl &draw_times,
 		profiler_print_interval = 3;
 	}
 
-	// Update graphs
-	g_profiler->graphAdd("Time non-rendering [us]",
-		draw_times.busy_time - stats.drawtime);
-	g_profiler->graphAdd("Sleep [us]", draw_times.sleep_time);
-
-	g_profiler->graphSet("FPS", 1.0f / dtime);
-
-	auto stats2 = driver->getFrameStats();
-	g_profiler->avg("Irr: drawcalls", stats2.Drawcalls);
-	if (stats2.Drawcalls > 0)
-		g_profiler->avg("Irr: primitives per drawcall",
-			stats2.PrimitivesDrawn / float(stats2.Drawcalls));
-	g_profiler->avg("Irr: HW buffers uploaded", stats2.HWBuffersUploaded);
-	g_profiler->avg("Irr: HW buffers active", stats2.HWBuffersActive);
-	u32 skinned_meshes = stats2.SWSkinnedMeshes + stats2.HWSkinnedMeshes;
-	if (skinned_meshes > 0) {
-		f32 use_pct = std::floor(100.0f * stats2.HWSkinnedMeshes / skinned_meshes);
-		g_profiler->avg("Irr: HW skinning use [%]", use_pct);
-	}
-
 	if (profiler_interval.step(dtime, profiler_print_interval)) {
 		if (print_to_log) {
 			infostream << "Profiler:" << std::endl;
@@ -1308,6 +1946,13 @@ void Game::updateProfilers(const RunStats &stats, const FpsControl &draw_times,
 		m_game_ui->updateProfiler();
 		g_profiler->clear();
 	}
+
+	// Update graphs
+	g_profiler->graphAdd("Time non-rendering [us]",
+		draw_times.busy_time - stats.drawtime);
+	g_profiler->graphAdd("Sleep [us]", draw_times.sleep_time);
+
+	g_profiler->graphSet("FPS", 1.0f / dtime);
 }
 
 void Game::updateStats(RunStats *stats, const FpsControl &draw_times,
@@ -1367,17 +2012,8 @@ void Game::updateStats(RunStats *stats, const FpsControl &draw_times,
 
 void Game::processUserInput(f32 dtime)
 {
-	bool desired = shouldShowTouchControls();
-	if (desired && !g_touchcontrols) {
-		g_touchcontrols = new TouchControls(device, texture_src);
-
-	} else if (!desired && g_touchcontrols) {
-		delete g_touchcontrols;
-		g_touchcontrols = nullptr;
-	}
-
 	// Reset input if window not active or some menu is active
-	if (!device->isWindowActive() || isMenuActive() || guienv->hasFocus(gui_chat_console.get())) {
+	if (!device->isWindowActive() || isMenuActive() || guienv->hasFocus(gui_chat_console)) {
 		if (m_game_focused) {
 			m_game_focused = false;
 			infostream << "Game lost focus" << std::endl;
@@ -1386,23 +2022,21 @@ void Game::processUserInput(f32 dtime)
 			input->clear();
 		}
 
-		if (g_touchcontrols)
-			g_touchcontrols->hide();
+		if (g_touchscreengui)
+			g_touchscreengui->hide();
 
 	} else {
-		if (g_touchcontrols) {
-			/* on touchcontrols step may generate own input events which ain't
+		if (g_touchscreengui) {
+			/* on touchscreengui step may generate own input events which ain't
 			 * what we want in case we just did clear them */
-			g_touchcontrols->show();
-			g_touchcontrols->step(dtime);
+			g_touchscreengui->show();
+			g_touchscreengui->step(dtime);
 		}
 
 		m_game_focused = true;
 	}
 
-	if (!guienv->hasFocus(gui_chat_console.get()) && gui_chat_console->isOpen()
-		&& !gui_chat_console->isMyDescendant(guienv->getFocus()))
-	{
+	if (!guienv->hasFocus(gui_chat_console) && gui_chat_console->isOpen()) {
 		gui_chat_console->closeConsoleAtOnce();
 	}
 
@@ -1410,7 +2044,10 @@ void Game::processUserInput(f32 dtime)
 	input->step(dtime);
 
 #ifdef __ANDROID__
-	if (!m_game_formspec.handleAndroidUIInput())
+	auto formspec = m_game_ui->getFormspecGUI();
+	if (formspec)
+		formspec->getAndroidUIInput();
+	else
 		handleAndroidChatInput();
 #endif
 
@@ -1435,13 +2072,13 @@ void Game::processKeyInput()
 		if (g_settings->getBool("continuous_forward"))
 			toggleAutoforward();
 	} else if (wasKeyDown(KeyType::INVENTORY)) {
-		m_game_formspec.showPlayerInventory(nullptr);
+		openInventory();
 	} else if (input->cancelPressed()) {
 #ifdef __ANDROID__
 		m_android_chat_open = false;
 #endif
 		if (!gui_chat_console->isOpenInhibited()) {
-			m_game_formspec.showPauseMenu();
+			showPauseMenu();
 		}
 	} else if (wasKeyDown(KeyType::CHAT)) {
 		openConsole(0.2, L"");
@@ -1466,22 +2103,34 @@ void Game::processKeyInput()
 		toggleNoClip();
 #if USE_SOUND
 	} else if (wasKeyDown(KeyType::MUTE)) {
-		bool new_mute_sound = !g_settings->getBool("mute_sound");
-		g_settings->setBool("mute_sound", new_mute_sound);
-		if (new_mute_sound)
-			m_game_ui->showTranslatedStatusText("Sound muted");
-		else
-			m_game_ui->showTranslatedStatusText("Sound unmuted");
+		if (g_settings->getBool("enable_sound")) {
+			bool new_mute_sound = !g_settings->getBool("mute_sound");
+			g_settings->setBool("mute_sound", new_mute_sound);
+			if (new_mute_sound)
+				m_game_ui->showTranslatedStatusText("Sound muted");
+			else
+				m_game_ui->showTranslatedStatusText("Sound unmuted");
+		} else {
+			m_game_ui->showTranslatedStatusText("Sound system is disabled");
+		}
 	} else if (wasKeyDown(KeyType::INC_VOLUME)) {
-		float new_volume = g_settings->getFloat("sound_volume", 0.0f, 0.9f) + 0.1f;
-		g_settings->setFloat("sound_volume", new_volume);
-		std::wstring msg = fwgettext("Volume changed to %d%%", myround(new_volume * 100));
-		m_game_ui->showStatusText(msg);
+		if (g_settings->getBool("enable_sound")) {
+			float new_volume = g_settings->getFloat("sound_volume", 0.0f, 0.9f) + 0.1f;
+			g_settings->setFloat("sound_volume", new_volume);
+			std::wstring msg = fwgettext("Volume changed to %d%%", myround(new_volume * 100));
+			m_game_ui->showStatusText(msg);
+		} else {
+			m_game_ui->showTranslatedStatusText("Sound system is disabled");
+		}
 	} else if (wasKeyDown(KeyType::DEC_VOLUME)) {
-		float new_volume = g_settings->getFloat("sound_volume", 0.1f, 1.0f) - 0.1f;
-		g_settings->setFloat("sound_volume", new_volume);
-		std::wstring msg = fwgettext("Volume changed to %d%%", myround(new_volume * 100));
-		m_game_ui->showStatusText(msg);
+		if (g_settings->getBool("enable_sound")) {
+			float new_volume = g_settings->getFloat("sound_volume", 0.1f, 1.0f) - 0.1f;
+			g_settings->setFloat("sound_volume", new_volume);
+			std::wstring msg = fwgettext("Volume changed to %d%%", myround(new_volume * 100));
+			m_game_ui->showStatusText(msg);
+		} else {
+			m_game_ui->showTranslatedStatusText("Sound system is disabled");
+		}
 #else
 	} else if (wasKeyDown(KeyType::MUTE) || wasKeyDown(KeyType::INC_VOLUME)
 			|| wasKeyDown(KeyType::DEC_VOLUME)) {
@@ -1490,7 +2139,7 @@ void Game::processKeyInput()
 	} else if (wasKeyDown(KeyType::CINEMATIC)) {
 		toggleCinematic();
 	} else if (wasKeyPressed(KeyType::SCREENSHOT)) {
-		client->requestScreenshot();
+		client->makeScreenshot();
 	} else if (wasKeyPressed(KeyType::TOGGLE_BLOCK_BOUNDS)) {
 		toggleBlockBounds();
 	} else if (wasKeyPressed(KeyType::TOGGLE_HUD)) {
@@ -1503,9 +2152,6 @@ void Game::processKeyInput()
 		toggleFog();
 	} else if (wasKeyDown(KeyType::TOGGLE_UPDATE_CAMERA)) {
 		toggleUpdateCamera();
-	} else if (wasKeyPressed(KeyType::CAMERA_MODE)) {
-		camera->toggleCameraMode();
-		updateCameraMode();
 	} else if (wasKeyPressed(KeyType::TOGGLE_DEBUG)) {
 		toggleDebug();
 	} else if (wasKeyPressed(KeyType::TOGGLE_PROFILER)) {
@@ -1542,14 +2188,12 @@ void Game::processItemSelection(u16 *new_playeritem)
 {
 	LocalPlayer *player = client->getEnv().getLocalPlayer();
 
-	*new_playeritem = player->getWieldIndex();
-	u16 max_item = player->getMaxHotbarItemcount();
-	if (max_item == 0)
-		return;
-	max_item -= 1;
-
 	/* Item selection using mouse wheel
 	 */
+	*new_playeritem = player->getWieldIndex();
+	u16 max_item = MYMIN(PLAYER_INVENTORY_SIZE - 1,
+		    player->hud_hotbar_itemcount - 1);
+
 	s32 wheel = input->getMouseWheel();
 	if (!m_enable_hotbar_mouse_wheel)
 		wheel = 0;
@@ -1579,8 +2223,8 @@ void Game::processItemSelection(u16 *new_playeritem)
 		}
 	}
 
-	if (g_touchcontrols) {
-		std::optional<u16> selection = g_touchcontrols->getHotbarSelection();
+	if (g_touchscreengui) {
+		std::optional<u16> selection = g_touchscreengui->getHotbarSelection();
 		if (selection)
 			*new_playeritem = *selection;
 	}
@@ -1599,6 +2243,45 @@ void Game::dropSelectedItem(bool single_item)
 	a->from_i = client->getEnv().getLocalPlayer()->getWieldIndex();
 	client->inventoryAction(a);
 }
+
+
+void Game::openInventory()
+{
+	/*
+	 * Don't permit to open inventory is CAO or player doesn't exists.
+	 * This prevent showing an empty inventory at player load
+	 */
+
+	LocalPlayer *player = client->getEnv().getLocalPlayer();
+	if (!player || !player->getCAO())
+		return;
+
+	infostream << "Game: Launching inventory" << std::endl;
+
+	PlayerInventoryFormSource *fs_src = new PlayerInventoryFormSource(client);
+
+	InventoryLocation inventoryloc;
+	inventoryloc.setCurrentPlayer();
+
+	if (client->modsLoaded() && client->getScript()->on_inventory_open(fs_src->m_client->getInventory(inventoryloc))) {
+		delete fs_src;
+		return;
+	}
+
+	if (fs_src->getForm().empty()) {
+		delete fs_src;
+		return;
+	}
+
+	TextDest *txt_dst = new TextDestPlayerInventory(client);
+	auto *&formspec = m_game_ui->updateFormspec("");
+	GUIFormSpecMenu::create(formspec, client, m_rendering_engine->get_gui_env(),
+		&input->joystick, fs_src, txt_dst, client->getFormspecPrepend(),
+		sound_manager.get());
+
+	formspec->setFormSpec(fs_src->getForm(), inventoryloc);
+}
+
 
 void Game::openConsole(float scale, const wchar_t *line)
 {
@@ -1781,11 +2464,13 @@ void Game::toggleMinimap(bool shift_pressed)
 	// -->
 	u32 hud_flags = client->getEnv().getLocalPlayer()->hud_flags;
 
+	if (hud_flags & HUD_FLAG_MINIMAP_VISIBLE) {
 	// If radar is disabled, try to find a non radar mode or fall back to 0
-	if (!(hud_flags & HUD_FLAG_MINIMAP_RADAR_VISIBLE))
-		while (mapper->getModeIndex() &&
-				mapper->getModeDef().type == MINIMAP_TYPE_RADAR)
-			mapper->nextMode();
+		if (!(hud_flags & HUD_FLAG_MINIMAP_RADAR_VISIBLE))
+			while (mapper->getModeIndex() &&
+					mapper->getModeDef().type == MINIMAP_TYPE_RADAR)
+				mapper->nextMode();
+	}
 	// <--
 	// End of 'not so satifying code'
 	if (hud && hud->hasElementOfType(HUD_ELEM_MINIMAP))
@@ -1813,44 +2498,45 @@ void Game::toggleDebug()
 	LocalPlayer *player = client->getEnv().getLocalPlayer();
 	bool has_debug = client->checkPrivilege("debug");
 	bool has_basic_debug = has_debug || (player->hud_flags & HUD_FLAG_BASIC_DEBUG);
-
 	// Initial: No debug info
 	// 1x toggle: Debug text
 	// 2x toggle: Debug text with profiler graph
 	// 3x toggle: Debug text and wireframe (needs "debug" priv)
-	// 4x toggle: Debug text and bbox (needs "debug" priv)
+	// Next toggle: Back to initial
 	//
 	// The debug text can be in 2 modes: minimal and basic.
 	// * Minimal: Only technical client info that not gameplay-relevant
 	// * Basic: Info that might give gameplay advantage, e.g. pos, angle
 	// Basic mode is used when player has the debug HUD flag set,
 	// otherwise the Minimal mode is used.
-
-	auto &state = m_flags.debug_state;
-	state = (state + 1) % 5;
-	if (state >= 3 && !has_debug)
-		state = 0;
-
-	m_game_ui->m_flags.show_minimal_debug = state > 0;
-	m_game_ui->m_flags.show_basic_debug = state > 0 && has_basic_debug;
-	m_game_ui->m_flags.show_profiler_graph = state == 2;
-	draw_control->show_wireframe = state == 3;
-	smgr->setGlobalDebugData(state == 4 ? bbox_debug_flag : 0,
-			state == 4 ? 0 : bbox_debug_flag);
-
-	if (state == 1) {
+	if (!m_game_ui->m_flags.show_minimal_debug) {
+		m_game_ui->m_flags.show_minimal_debug = true;
+		if (has_basic_debug)
+			m_game_ui->m_flags.show_basic_debug = true;
+		m_game_ui->m_flags.show_profiler_graph = false;
+		draw_control->show_wireframe = false;
 		m_game_ui->showTranslatedStatusText("Debug info shown");
-	} else if (state == 2) {
+	} else if (!m_game_ui->m_flags.show_profiler_graph && !draw_control->show_wireframe) {
+		if (has_basic_debug)
+			m_game_ui->m_flags.show_basic_debug = true;
+		m_game_ui->m_flags.show_profiler_graph = true;
 		m_game_ui->showTranslatedStatusText("Profiler graph shown");
-	} else if (state == 3) {
-		if (driver->getDriverType() == video::EDT_OGLES2)
-			m_game_ui->showTranslatedStatusText("Wireframe not supported by video driver");
-		else
-			m_game_ui->showTranslatedStatusText("Wireframe shown");
-	} else if (state == 4) {
-		m_game_ui->showTranslatedStatusText("Bounding boxes shown");
+	} else if (!draw_control->show_wireframe && client->checkPrivilege("debug")) {
+		if (has_basic_debug)
+			m_game_ui->m_flags.show_basic_debug = true;
+		m_game_ui->m_flags.show_profiler_graph = false;
+		draw_control->show_wireframe = true;
+		m_game_ui->showTranslatedStatusText("Wireframe shown");
 	} else {
-		m_game_ui->showTranslatedStatusText("All debug info hidden");
+		m_game_ui->m_flags.show_minimal_debug = false;
+		m_game_ui->m_flags.show_basic_debug = false;
+		m_game_ui->m_flags.show_profiler_graph = false;
+		draw_control->show_wireframe = false;
+		if (has_debug) {
+			m_game_ui->showTranslatedStatusText("Debug info, profiler graph, and wireframe hidden");
+		} else {
+			m_game_ui->showTranslatedStatusText("Debug info and profiler graph hidden");
+		}
 	}
 }
 
@@ -1936,14 +2622,14 @@ void Game::updateCameraDirection(CameraOrientation *cam, float dtime)
 {
 	auto *cur_control = device->getCursorControl();
 
-	/* On Linux and Windows, enabling relative mouse mode somehow results
-	in simulated mouse events being generated from touch events, even though
-	SDL_HINT_MOUSE_TOUCH_EVENTS and SDL_HINT_TOUCH_MOUSE_EVENTS are set to 0.
-	Since we have our own code to synthesize mouse events from touch events,
+	/* With CIrrDeviceSDL on Linux and Windows, enabling relative mouse mode
+	somehow results in simulated mouse events being generated from touch events,
+	although SDL_HINT_MOUSE_TOUCH_EVENTS and SDL_HINT_TOUCH_MOUSE_EVENTS are set to 0.
+	Since Minetest has its own code to synthesize mouse events from touch events,
 	this results in duplicated input. To avoid that, we don't enable relative
 	mouse mode if we're in touchscreen mode. */
 	if (cur_control)
-		cur_control->setRelativeMode(!g_touchcontrols && !isMenuActive());
+		cur_control->setRelativeMode(!g_touchscreengui && !isMenuActive());
 
 	if ((device->isWindowActive() && device->isWindowFocused()
 			&& !isMenuActive()) || input->isRandom()) {
@@ -1954,11 +2640,9 @@ void Game::updateCameraDirection(CameraOrientation *cam, float dtime)
 				cur_control->setVisible(false);
 		}
 
-		if (m_first_loop_after_window_activation && !g_touchcontrols) {
+		if (m_first_loop_after_window_activation) {
 			m_first_loop_after_window_activation = false;
 
-			// Discard any movement that happened while the window was inactive
-			input->getMouseMovement();
 			input->setMousePos(driver->getScreenSize().Width / 2,
 				driver->getScreenSize().Height / 2);
 		} else {
@@ -1972,8 +2656,6 @@ void Game::updateCameraDirection(CameraOrientation *cam, float dtime)
 
 		m_first_loop_after_window_activation = true;
 	}
-	if (g_touchcontrols)
-		m_first_loop_after_window_activation = true;
 }
 
 // Get the factor to multiply with sensitivity to get the same mouse/joystick
@@ -1988,61 +2670,35 @@ f32 Game::getSensitivityScaleFactor() const
 	return std::tan(fov_y / 2.0f) * 1.3763819f;
 }
 
-bool Game::isTouchShootlineUsed() const
-{
-	return g_touchcontrols && g_touchcontrols->isShootlineAvailable() &&
-			camera->getCameraMode() == CAMERA_MODE_FIRST;
-}
-
 void Game::updateCameraOrientation(CameraOrientation *cam, float dtime)
 {
-	f32 sens_scale = getSensitivityScaleFactor();
-
-	if (g_touchcontrols) {
-		// User setting is already applied by TouchControls.
-		cam->camera_yaw   += g_touchcontrols->getYawChange()   * sens_scale;
-		cam->camera_pitch += g_touchcontrols->getPitchChange() * sens_scale;
+	if (g_touchscreengui) {
+		cam->camera_yaw   += g_touchscreengui->getYawChange();
+		cam->camera_pitch += g_touchscreengui->getPitchChange();
 	} else {
-		v2s32 dist = input->getMouseMovement();
+		v2s32 center(driver->getScreenSize().Width / 2, driver->getScreenSize().Height / 2);
+		v2s32 dist = input->getMousePos() - center;
 
 		if (m_invert_mouse || camera->getCameraMode() == CAMERA_MODE_THIRD_FRONT) {
 			dist.Y = -dist.Y;
 		}
 
+		f32 sens_scale = getSensitivityScaleFactor();
 		cam->camera_yaw   -= dist.X * m_cache_mouse_sensitivity * sens_scale;
 		cam->camera_pitch += dist.Y * m_cache_mouse_sensitivity * sens_scale;
 
-		// Keep the cursor centered so that it appears in the middle of
-		// the screen when a menu opens.
-		if (dist.X != 0 || dist.Y != 0) {
-			v2s32 center(driver->getScreenSize().Width / 2, driver->getScreenSize().Height / 2);
+		if (dist.X != 0 || dist.Y != 0)
 			input->setMousePos(center.X, center.Y);
-		}
 	}
 
-	// Keyboard look
-	const f32 rate = dtime * sens_scale;
+	if (m_cache_enable_joysticks) {
+		f32 sens_scale = getSensitivityScaleFactor();
+		f32 c = m_cache_joystick_frustum_sensitivity * dtime * sens_scale;
+		cam->camera_yaw -= input->joystick.getAxisWithoutDead(JA_FRUSTUM_HORIZONTAL) * c;
+		cam->camera_pitch += input->joystick.getAxisWithoutDead(JA_FRUSTUM_VERTICAL) * c;
+	}
 
-	if (input->isKeyDown(KeyType::CAMERA_YAW_LEFT))
-		cam->camera_yaw += input->getAxisValue(KeyType::CAMERA_YAW_LEFT) * rate;
-	if (input->isKeyDown(KeyType::CAMERA_YAW_RIGHT))
-		cam->camera_yaw -= input->getAxisValue(KeyType::CAMERA_YAW_RIGHT) * rate;
-	if (input->isKeyDown(KeyType::CAMERA_PITCH_UP))
-		cam->camera_pitch -= input->getAxisValue(KeyType::CAMERA_PITCH_UP) * rate;
-	if (input->isKeyDown(KeyType::CAMERA_PITCH_DOWN))
-		cam->camera_pitch += input->getAxisValue(KeyType::CAMERA_PITCH_DOWN) * rate;
-
-	cam->camera_pitch = rangelim(cam->camera_pitch, -90, 90);
-}
-
-
-// Get the state of an optionally togglable key
-bool Game::getTogglableKeyState(GameKeyType key, bool toggling_enabled, bool prev_key_state)
-{
-	if (!toggling_enabled)
-		return isKeyDown(key);
-	else
-		return prev_key_state ^ wasKeyPressed(key);
+	cam->camera_pitch = rangelim(cam->camera_pitch, -89.5, 89.5);
 }
 
 
@@ -2050,42 +2706,40 @@ void Game::updatePlayerControl(const CameraOrientation &cam)
 {
 	LocalPlayer *player = client->getEnv().getLocalPlayer();
 
-	// In free move (fly), the "toggle_sneak_key" setting would prevent precise
-	// up/down movements. Hence, enable the feature only during 'normal' movement.
-	const bool allow_sneak_toggle = m_cache_toggle_sneak_key &&
-		!(player->getPlayerSettings().free_move && client->checkPrivilege("fly"));
-
 	//TimeTaker tt("update player control", NULL, PRECISION_NANO);
 
-	float forward_value = getAxisValue(KeyType::FORWARD);
-	if (player->getPlayerSettings().continuous_forward &&
-			client->activeObjectsReceived() && !player->isDead()) {
-		// autoforward if set: move at maximum speed
-		forward_value = 1.0f;
-	}
-
 	PlayerControl control(
-		forward_value,
-		getAxisValue(KeyType::BACKWARD),
-		getAxisValue(KeyType::LEFT),
-		getAxisValue(KeyType::RIGHT),
+		isKeyDown(KeyType::FORWARD),
+		isKeyDown(KeyType::BACKWARD),
+		isKeyDown(KeyType::LEFT),
+		isKeyDown(KeyType::RIGHT),
 		isKeyDown(KeyType::JUMP) || player->getAutojump(),
-		getTogglableKeyState(KeyType::AUX1,  m_cache_toggle_aux1_key, player->control.aux1),
-		getTogglableKeyState(KeyType::SNEAK, allow_sneak_toggle,      player->control.sneak),
+		isKeyDown(KeyType::AUX1),
+		isKeyDown(KeyType::SNEAK),
 		isKeyDown(KeyType::ZOOM),
 		isKeyDown(KeyType::DIG),
 		isKeyDown(KeyType::PLACE),
 		cam.camera_pitch,
-		cam.camera_yaw
+		cam.camera_yaw,
+		input->getMovementSpeed(),
+		input->getMovementDirection()
 	);
-	control.setMovementFromKeys();
+
+	// autoforward if set: move at maximum speed
+	if (player->getPlayerSettings().continuous_forward &&
+			client->activeObjectsReceived() && !player->isDead()) {
+		control.movement_speed = 1.0f;
+		// sideways movement only
+		float dx = std::sin(control.movement_direction);
+		control.movement_direction = std::atan2(dx, 1.0f);
+	}
 
 	/* For touch, simulate holding down AUX1 (fast move) if the user has
 	 * the fast_move setting toggled on. If there is an aux1 key defined for
 	 * touch then its meaning is inverted (i.e. holding aux1 means walk and
 	 * not fast)
 	 */
-	if (g_touchcontrols && m_touch_simulate_aux1) {
+	if (g_touchscreengui && m_touch_simulate_aux1) {
 		control.aux1 = control.aux1 ^ true;
 	}
 
@@ -2111,10 +2765,8 @@ void Game::updatePauseState()
 
 inline void Game::step(f32 dtime)
 {
-	ZoneScoped;
-
 	if (server) {
-		float fps_max = !device->isWindowFocused() && simple_singleplayer_mode ?
+		float fps_max = (!device->isWindowFocused() || g_menumgr.pausesGame()) ?
 				g_settings->getFloat("fps_max_unfocused") :
 				g_settings->getFloat("fps_max");
 		fps_max = std::max(fps_max, 1.0f);
@@ -2145,13 +2797,12 @@ static void pauseNodeAnimation(PausedNodesList &paused, scene::ISceneNode *node)
 		pauseNodeAnimation(paused, child);
 	if (node->getType() != scene::ESNT_ANIMATED_MESH)
 		return;
-	auto animated_node = static_cast<scene::AnimatedMeshSceneNode *>(node);
-	std::vector<PausedNode::Track> tracks;
-	for (auto &[track, spec] : animated_node->getAnimation().tracks) {
-		tracks.emplace_back(PausedNode::Track{track, spec.fps});
-		spec.fps = 0.0f;
-	}
-	paused.emplace_back(PausedNode{grab(animated_node), tracks});
+	auto animated_node = static_cast<scene::IAnimatedMeshSceneNode *>(node);
+	float speed = animated_node->getAnimationSpeed();
+	if (!speed)
+		return;
+	paused.push_back({grab(animated_node), speed});
+	animated_node->setAnimationSpeed(0.0f);
 }
 
 void Game::pauseAnimation()
@@ -2161,12 +2812,8 @@ void Game::pauseAnimation()
 
 void Game::resumeAnimation()
 {
-	for (const auto &paused: paused_animated_nodes) {
-		for (const PausedNode::Track &track: paused.tracks) {
-			auto &spec = paused.node->getAnimation().tracks[track.id];
-			spec.fps = track.fps;
-		}
-	}
+	for (auto &&pair: paused_animated_nodes)
+		pair.first->setAnimationSpeed(pair.second);
 	paused_animated_nodes.clear();
 }
 
@@ -2174,10 +2821,9 @@ const ClientEventHandler Game::clientEventHandler[CLIENTEVENT_MAX] = {
 	{&Game::handleClientEvent_None},
 	{&Game::handleClientEvent_PlayerDamage},
 	{&Game::handleClientEvent_PlayerForceMove},
-	{&Game::handleClientEvent_DeathscreenLegacy},
+	{&Game::handleClientEvent_Deathscreen},
 	{&Game::handleClientEvent_ShowFormSpec},
-	{&Game::handleClientEvent_ShowCSMFormSpec},
-	{&Game::handleClientEvent_ShowPauseMenuFormSpec},
+	{&Game::handleClientEvent_ShowLocalFormSpec},
 	{&Game::handleClientEvent_HandleParticleEvent},
 	{&Game::handleClientEvent_HandleParticleEvent},
 	{&Game::handleClientEvent_HandleParticleEvent},
@@ -2188,9 +2834,8 @@ const ClientEventHandler Game::clientEventHandler[CLIENTEVENT_MAX] = {
 	{&Game::handleClientEvent_SetSun},
 	{&Game::handleClientEvent_SetMoon},
 	{&Game::handleClientEvent_SetStars},
-	{&Game::handleClientEvent_OverrideDayNightRatio},
+	{&Game::handleClientEvent_OverrideDayNigthRatio},
 	{&Game::handleClientEvent_CloudParams},
-	{&Game::handleClientEvent_UpdateCamera},
 };
 
 void Game::handleClientEvent_None(ClientEvent *event, CameraOrientation *cam)
@@ -2214,10 +2859,8 @@ void Game::handleClientEvent_PlayerDamage(ClientEvent *event, CameraOrientation 
 			player->getCAO()->getProperties().hp_max : PLAYER_MAX_HP_DEFAULT;
 		f32 damage_ratio = event->player_damage.amount / hp_max;
 
-		if (g_settings->getBool("hurt_flash_enabled")) {
-			runData.damage_flash += 95.0f + 64.f * damage_ratio;
-			runData.damage_flash = MYMIN(runData.damage_flash, 127.0f);
-		}
+		runData.damage_flash += 95.0f + 64.f * damage_ratio;
+		runData.damage_flash = MYMIN(runData.damage_flash, 127.0f);
 
 		player->hurt_tilt_timer = 1.5f;
 		player->hurt_tilt_strength =
@@ -2234,38 +2877,53 @@ void Game::handleClientEvent_PlayerForceMove(ClientEvent *event, CameraOrientati
 	cam->camera_pitch = event->player_force_move.pitch;
 }
 
-void Game::handleClientEvent_DeathscreenLegacy(ClientEvent *event, CameraOrientation *cam)
+void Game::handleClientEvent_Deathscreen(ClientEvent *event, CameraOrientation *cam)
 {
-	m_game_formspec.showDeathFormspecLegacy();
+	// If client scripting is enabled, deathscreen is handled by CSM code in
+	// builtin/client/init.lua
+	if (client->modsLoaded())
+		client->getScript()->on_death();
+	else
+		showDeathFormspec();
+
+	/* Handle visualization */
+	LocalPlayer *player = client->getEnv().getLocalPlayer();
+	runData.damage_flash = 0;
+	player->hurt_tilt_timer = 0;
+	player->hurt_tilt_strength = 0;
 }
 
 void Game::handleClientEvent_ShowFormSpec(ClientEvent *event, CameraOrientation *cam)
 {
-	auto &fs = event->show_formspec;
-
-	if (fs.formname->empty() && !fs.formspec->empty()) {
-		m_game_formspec.showPlayerInventory(fs.formspec);
+	if (event->show_formspec.formspec->empty()) {
+		auto formspec = m_game_ui->getFormspecGUI();
+		if (formspec && (event->show_formspec.formname->empty()
+				|| *(event->show_formspec.formname) == m_game_ui->getFormspecName())) {
+			formspec->quitMenu();
+		}
 	} else {
-		m_game_formspec.showFormSpec(*fs.formspec, *fs.formname);
+		FormspecFormSource *fs_src =
+			new FormspecFormSource(*(event->show_formspec.formspec));
+		TextDestPlayerInventory *txt_dst =
+			new TextDestPlayerInventory(client, *(event->show_formspec.formname));
+
+		auto *&formspec = m_game_ui->updateFormspec(*(event->show_formspec.formname));
+		GUIFormSpecMenu::create(formspec, client, m_rendering_engine->get_gui_env(),
+			&input->joystick, fs_src, txt_dst, client->getFormspecPrepend(),
+			sound_manager.get());
 	}
-
-	delete fs.formspec;
-	delete fs.formname;
-}
-
-void Game::handleClientEvent_ShowCSMFormSpec(ClientEvent *event, CameraOrientation *cam)
-{
-	m_game_formspec.showCSMFormSpec(*event->show_formspec.formspec,
-		*event->show_formspec.formname);
 
 	delete event->show_formspec.formspec;
 	delete event->show_formspec.formname;
 }
 
-void Game::handleClientEvent_ShowPauseMenuFormSpec(ClientEvent *event, CameraOrientation *cam)
+void Game::handleClientEvent_ShowLocalFormSpec(ClientEvent *event, CameraOrientation *cam)
 {
-	m_game_formspec.showPauseMenuFormSpec(*event->show_formspec.formspec,
-		*event->show_formspec.formname);
+	FormspecFormSource *fs_src = new FormspecFormSource(*event->show_formspec.formspec);
+	LocalFormspecHandler *txt_dst =
+		new LocalFormspecHandler(*event->show_formspec.formname, client);
+	GUIFormSpecMenu::create(m_game_ui->getFormspecGUI(), client, m_rendering_engine->get_gui_env(),
+			&input->joystick, fs_src, txt_dst, client->getFormspecPrepend(), sound_manager.get());
 
 	delete event->show_formspec.formspec;
 	delete event->show_formspec.formname;
@@ -2290,7 +2948,7 @@ void Game::handleClientEvent_HudAdd(ClientEvent *event, CameraOrientation *cam)
 		return;
 	}
 
-	auto e = std::make_unique<HudElement>();
+	HudElement *e = new HudElement;
 	e->type   = static_cast<HudElementType>(event->hudadd->type);
 	e->pos    = event->hudadd->pos;
 	e->name   = event->hudadd->name;
@@ -2302,12 +2960,11 @@ void Game::handleClientEvent_HudAdd(ClientEvent *event, CameraOrientation *cam)
 	e->align  = event->hudadd->align;
 	e->offset = event->hudadd->offset;
 	e->world_pos = event->hudadd->world_pos;
-	e->size      = v2f::from(event->hudadd->size);
+	e->size      = event->hudadd->size;
 	e->z_index   = event->hudadd->z_index;
 	e->text2     = event->hudadd->text2;
 	e->style     = event->hudadd->style;
-	e->hideable  = event->hudadd->hideable;
-	m_hud_server_to_client[server_id] = player->hud.add(std::move(e));
+	m_hud_server_to_client[server_id] = player->addHud(e);
 
 	delete event->hudadd;
 }
@@ -2318,7 +2975,8 @@ void Game::handleClientEvent_HudRemove(ClientEvent *event, CameraOrientation *ca
 
 	auto i = m_hud_server_to_client.find(event->hudrm.id);
 	if (i != m_hud_server_to_client.end()) {
-		player->hud.remove(i->second);
+		HudElement *e = player->removeHud(i->second);
+		delete e;
 		m_hud_server_to_client.erase(i);
 	}
 
@@ -2332,7 +2990,7 @@ void Game::handleClientEvent_HudChange(ClientEvent *event, CameraOrientation *ca
 
 	auto i = m_hud_server_to_client.find(event->hudchange->id);
 	if (i != m_hud_server_to_client.end()) {
-		e = player->hud.get(i->second);
+		e = player->getHud(i->second);
 	}
 
 	if (e == nullptr) {
@@ -2366,15 +3024,13 @@ void Game::handleClientEvent_HudChange(ClientEvent *event, CameraOrientation *ca
 
 		CASE_SET(HUD_STAT_WORLD_POS, world_pos, v3fdata);
 
-		CASE_SET(HUD_STAT_SIZE, size, v2fdata);
+		CASE_SET(HUD_STAT_SIZE, size, v2s32data);
 
 		CASE_SET(HUD_STAT_Z_INDEX, z_index, data);
 
 		CASE_SET(HUD_STAT_TEXT2, text2, sdata);
 
 		CASE_SET(HUD_STAT_STYLE, style, data);
-
-		CASE_SET(HUD_STAT_HIDEABLE, hideable, data);
 
 		case HudElementStat_END:
 			break;
@@ -2406,7 +3062,7 @@ void Game::handleClientEvent_SetSky(ClientEvent *event, CameraOrientation *cam)
 		);
 	} else if (event->set_sky->type == "skybox" &&
 			event->set_sky->textures.size() == 6) {
-		// Disable the dynamic mesh skybox:
+		// Disable the dyanmic mesh skybox:
 		sky->setVisible(false);
 		// Set fog colors:
 		sky->setFallbackBgColor(event->set_sky->bgcolor);
@@ -2452,8 +3108,6 @@ void Game::handleClientEvent_SetSky(ClientEvent *event, CameraOrientation *cam)
 
 	sky->setFogColor(event->set_sky->fog_color);
 
-	sky->setAutoCaveBrightness(event->set_sky->auto_dim_skybox);
-
 	delete event->set_sky;
 }
 
@@ -2484,11 +3138,10 @@ void Game::handleClientEvent_SetStars(ClientEvent *event, CameraOrientation *cam
 	sky->setStarColor(event->star_params->starcolor);
 	sky->setStarScale(event->star_params->scale);
 	sky->setStarDayOpacity(event->star_params->day_opacity);
-	sky->setStarSeed(event->star_params->star_seed);
 	delete event->star_params;
 }
 
-void Game::handleClientEvent_OverrideDayNightRatio(ClientEvent *event,
+void Game::handleClientEvent_OverrideDayNigthRatio(ClientEvent *event,
 		CameraOrientation *cam)
 {
 	client->getEnv().setDayNightRatioOverride(
@@ -2498,20 +3151,15 @@ void Game::handleClientEvent_OverrideDayNightRatio(ClientEvent *event,
 
 void Game::handleClientEvent_CloudParams(ClientEvent *event, CameraOrientation *cam)
 {
+	if (!clouds)
+		return;
+
 	clouds->setDensity(event->cloud_params.density);
 	clouds->setColorBright(video::SColor(event->cloud_params.color_bright));
 	clouds->setColorAmbient(video::SColor(event->cloud_params.color_ambient));
-	clouds->setColorShadow(video::SColor(event->cloud_params.color_shadow));
 	clouds->setHeight(event->cloud_params.height);
 	clouds->setThickness(event->cloud_params.thickness);
 	clouds->setSpeed(v2f(event->cloud_params.speed_x, event->cloud_params.speed_y));
-}
-
-void Game::handleClientEvent_UpdateCamera(ClientEvent *event, CameraOrientation *cam)
-{
-	// no parameters to update here, this just makes sure the camera is in the
-	// state it should be after something was changed.
-	updateCameraMode();
 }
 
 void Game::processClientEvents(CameraOrientation *cam)
@@ -2526,24 +3174,9 @@ void Game::processClientEvents(CameraOrientation *cam)
 
 void Game::updateChat(f32 dtime)
 {
-	auto color_for = [](LogLevel level) -> const char* {
-		switch (level) {
-		case LL_ERROR  : return "\x1b(c@#F00)"; // red
-		case LL_WARNING: return "\x1b(c@#EE0)"; // yellow
-		case LL_INFO   : return "\x1b(c@#BBB)"; // grey
-		case LL_VERBOSE: return "\x1b(c@#888)"; // dark grey
-		case LL_TRACE  : return "\x1b(c@#888)"; // dark grey
-		default        : return "";
-		}
-	};
-
 	// Get new messages from error log buffer
-	std::vector<LogEntry> entries = m_chat_log_buf.take();
-	for (const auto& entry : entries) {
-		std::string line;
-		line.append(color_for(entry.level)).append(entry.combined);
-		chat_backend->addMessage(L"", utf8_to_wide(line));
-	}
+	while (!m_chat_log_buf.empty())
+		chat_backend->addMessage(L"", utf8_to_wide(m_chat_log_buf.get()));
 
 	// Get new messages from client
 	std::wstring message;
@@ -2567,80 +3200,71 @@ void Game::updateChat(f32 dtime)
 
 void Game::updateCamera(f32 dtime)
 {
-	ClientEnvironment &env = client->getEnv();
-	LocalPlayer *player = env.getLocalPlayer();
+	LocalPlayer *player = client->getEnv().getLocalPlayer();
 
-	// For interaction purposes, get info about the held item
-	ItemStack playeritem, hand;
+	/*
+		For interaction purposes, get info about the held item
+		- What item is it?
+		- Is it a usable item?
+		- Can it point to liquids?
+	*/
+	ItemStack playeritem;
 	{
-		ItemStack selected;
+		ItemStack selected, hand;
 		playeritem = player->getWieldedItem(&selected, &hand);
 	}
 
 	ToolCapabilities playeritem_toolcap =
-		playeritem.getToolCapabilities(itemdef_manager, &hand);
+		playeritem.getToolCapabilities(itemdef_manager);
 
-	float full_punch_interval = playeritem_toolcap.full_punch_interval;
-	float tool_reload_ratio = runData.time_from_last_punch / full_punch_interval;
+	v3s16 old_camera_offset = camera->getOffset();
 
-	tool_reload_ratio = std::min(tool_reload_ratio, 1.0f);
-	camera->update(player, dtime, tool_reload_ratio);
-	camera->step(dtime);
+	if (wasKeyPressed(KeyType::CAMERA_MODE)) {
+		GenericCAO *playercao = player->getCAO();
 
-	if (!m_flags.disable_camera_update) {
-		client->getEnv().getClientMap().updateCamera(camera->getPosition(),
-			camera->getDirection(), camera->getFovMax(), camera->getOffset(),
-			player->light_color);
-	}
-}
+		// If playercao not loaded, don't change camera
+		if (!playercao)
+			return;
 
-void Game::updateCameraMode()
-{
-	LocalPlayer *player = client->getEnv().getLocalPlayer();
+		camera->toggleCameraMode();
 
-	// Obey server choice
-	if (player->allowed_camera_mode != CAMERA_MODE_ANY)
-		camera->setCameraMode(player->allowed_camera_mode);
+		if (g_touchscreengui)
+			g_touchscreengui->setUseCrosshair(!isTouchCrosshairDisabled());
 
-	GenericCAO *playercao = player->getCAO();
-	if (playercao) {
 		// Make the player visible depending on camera mode.
 		playercao->updateMeshCulling();
 		playercao->setChildrenVisible(camera->getCameraMode() > CAMERA_MODE_FIRST);
 	}
-}
 
-void Game::updateCameraOffset()
-{
-	ClientEnvironment &env = client->getEnv();
+	float full_punch_interval = playeritem_toolcap.full_punch_interval;
+	float tool_reload_ratio = runData.time_from_last_punch / full_punch_interval;
 
-	v3s16 old_camera_offset = camera->getOffset();
+	tool_reload_ratio = MYMIN(tool_reload_ratio, 1.0);
+	camera->update(player, dtime, tool_reload_ratio);
+	camera->step(dtime);
 
-	camera->updateOffset();
-
+	f32 camera_fov = camera->getFovMax();
 	v3s16 camera_offset = camera->getOffset();
 
-	m_camera_offset_changed = camera_offset != old_camera_offset;
-	if (!m_camera_offset_changed)
-		return;
+	m_camera_offset_changed = (camera_offset != old_camera_offset);
 
 	if (!m_flags.disable_camera_update) {
-		auto *shadow = RenderingEngine::get_shadow_renderer();
-		if (shadow) {
-			shadow->getDirectionalLight().updateCameraOffset(camera);
-			// FIXME: I bet we can be smarter about this and don't need to redraw
-			// the shadow map at all, but this is for someone else to figure out.
-			shadow->setForceUpdateShadowMap();
+		v3f camera_position = camera->getPosition();
+		v3f camera_direction = camera->getDirection();
+
+		client->getEnv().getClientMap().updateCamera(camera_position,
+				camera_direction, camera_fov, camera_offset, player->light_color);
+
+		if (m_camera_offset_changed) {
+			client->updateCameraOffset(camera_offset);
+			client->getEnv().updateCameraOffset(camera_offset);
+
+			if (clouds)
+				clouds->updateCameraOffset(camera_offset);
 		}
-
-		env.getClientMap().updateCamera(camera->getPosition(),
-			camera->getDirection(), camera->getFovMax(), camera_offset,
-			env.getLocalPlayer()->light_color);
-
-		env.updateCameraOffset(camera_offset);
-		clouds->updateCameraOffset(camera_offset);
 	}
 }
+
 
 void Game::updateSound(f32 dtime)
 {
@@ -2657,11 +3281,16 @@ void Game::updateSound(f32 dtime)
 
 	sound_volume_control(sound_manager.get(), device->isWindowActive());
 
-	// Update sound maker
+	// Tell the sound maker whether to make footstep sounds
+	soundmaker->makes_footstep_sound = player->makes_footstep_sound;
+
+	//	Update sound maker
+	if (player->makes_footstep_sound)
+		soundmaker->step(dtime);
+
 	ClientMap &map = client->getEnv().getClientMap();
 	MapNode n = map.getNode(player->getFootstepNodePos());
-	soundmaker->update(dtime, player->makes_footstep_sound,
-			nodedef_manager->get(n).sound_footstep);
+	soundmaker->m_player_step_sound = nodedef_manager->get(n).sound_footstep;
 }
 
 
@@ -2679,16 +3308,12 @@ void Game::processPlayerInteraction(f32 dtime, bool show_hud)
 	ItemStack selected_item, hand_item;
 	const ItemStack &tool_item = player->getWieldedItem(&selected_item, &hand_item);
 
-	const ItemDefinition &selected_def = tool_item.getDefinition(itemdef_manager);
-	f32 d = getToolRange(tool_item, hand_item, itemdef_manager);
+	const ItemDefinition &selected_def = selected_item.getDefinition(itemdef_manager);
+	f32 d = getToolRange(selected_item, hand_item, itemdef_manager);
 
 	core::line3d<f32> shootline;
 
 	switch (camera->getCameraMode()) {
-	case CAMERA_MODE_ANY:
-	case CameraMode_END:
-		assert(false);
-		break;
 	case CAMERA_MODE_FIRST:
 		// Shoot from camera position, with bobbing
 		shootline.start = camera->getPosition();
@@ -2705,8 +3330,8 @@ void Game::processPlayerInteraction(f32 dtime, bool show_hud)
 	}
 	shootline.end = shootline.start + camera_direction * BS * d;
 
-	if (isTouchShootlineUsed()) {
-		shootline = g_touchcontrols->getShootline();
+	if (g_touchscreengui && isTouchCrosshairDisabled()) {
+		shootline = g_touchscreengui->getShootline();
 		// Scale shootline to the acual distance the player can reach
 		shootline.end = shootline.start +
 				shootline.getVector().normalize() * BS * d;
@@ -2723,13 +3348,9 @@ void Game::processPlayerInteraction(f32 dtime, bool show_hud)
 	if (pointed != runData.pointed_old)
 		infostream << "Pointing at " << pointed.dump() << std::endl;
 
-	if (g_touchcontrols) {
-		auto mode = selected_def.touch_interaction.getMode(selected_def, pointed.type);
-		g_touchcontrols->applyContextControls(mode);
-		// applyContextControls may change dig/place input.
-		// Update again so that TOSERVER_INTERACT packets have the correct controls set.
-		player->control.dig = isKeyDown(KeyType::DIG);
-		player->control.place = isKeyDown(KeyType::PLACE);
+	if (g_touchscreengui) {
+		auto mode = selected_def.touch_interaction.getMode(pointed.type);
+		g_touchscreengui->applyContextControls(mode);
 	}
 
 	// Note that updating the selection mesh every frame is not particularly efficient,
@@ -2798,7 +3419,7 @@ void Game::processPlayerInteraction(f32 dtime, bool show_hud)
 	} else if (pointed.type == POINTEDTHING_OBJECT) {
 		v3f player_position  = player->getPosition();
 		bool basic_debug_allowed = client->checkPrivilege("debug") || (player->hud_flags & HUD_FLAG_BASIC_DEBUG);
-		handlePointingAtObject(pointed, tool_item, hand_item, player_position,
+		handlePointingAtObject(pointed, tool_item, player_position,
 				m_game_ui->m_flags.show_basic_debug && basic_debug_allowed);
 	} else if (isKeyDown(KeyType::DIG)) {
 		// When button is held down in air, show continuous animation
@@ -2820,6 +3441,12 @@ void Game::processPlayerInteraction(f32 dtime, bool show_hud)
 	// Ensure DIG & PLACE are marked as handled
 	wasKeyDown(KeyType::DIG);
 	wasKeyDown(KeyType::PLACE);
+
+	input->joystick.clearWasKeyPressed(KeyType::DIG);
+	input->joystick.clearWasKeyPressed(KeyType::PLACE);
+
+	input->joystick.clearWasKeyReleased(KeyType::DIG);
+	input->joystick.clearWasKeyReleased(KeyType::PLACE);
 }
 
 
@@ -2850,18 +3477,17 @@ PointedThing Game::updatePointedThing(
 		hud->pointing_at_object = true;
 
 		runData.selected_object = client->getEnv().getActiveObject(result.object_id);
-		aabb3f selection_box{{0.0f, 0.0f, 0.0f}};
+		aabb3f selection_box;
 		if (show_entity_selectionbox && runData.selected_object->doShowSelectionBox() &&
 				runData.selected_object->getSelectionBox(&selection_box)) {
 			v3f pos = runData.selected_object->getPosition();
-			selectionboxes->push_back(selection_box);
+			selectionboxes->push_back(aabb3f(selection_box));
 			hud->setSelectionPos(pos, camera_offset);
 			GenericCAO* gcao = dynamic_cast<GenericCAO*>(runData.selected_object);
 			if (gcao != nullptr && gcao->getProperties().rotate_selectionbox)
-				hud->setSelectionRotationRadians(gcao->getSceneNode()
-						->getAbsoluteTransformation().getRotationRadians());
+				hud->setSelectionRotation(gcao->getSceneNode()->getAbsoluteTransformation().getRotationDegrees());
 			else
-				hud->setSelectionRotationRadians(v3f());
+				hud->setSelectionRotation(v3f());
 		}
 		hud->setSelectedFaceNormal(result.raw_intersection_normal);
 	} else if (result.type == POINTEDTHING_NODE) {
@@ -2871,15 +3497,17 @@ PointedThing Game::updatePointedThing(
 		n.getSelectionBoxes(nodedef, &boxes,
 			n.getNeighbors(result.node_undersurface, &map));
 
-		f32 d = 0.002f * BS;
-		for (aabb3f box : boxes) {
+		f32 d = 0.002 * BS;
+		for (std::vector<aabb3f>::const_iterator i = boxes.begin();
+			i != boxes.end(); ++i) {
+			aabb3f box = *i;
 			box.MinEdge -= v3f(d, d, d);
 			box.MaxEdge += v3f(d, d, d);
 			selectionboxes->push_back(box);
 		}
 		hud->setSelectionPos(intToFloat(result.node_undersurface, BS),
 			camera_offset);
-		hud->setSelectionRotationRadians(v3f());
+		hud->setSelectionRotation(v3f());
 		hud->setSelectedFaceNormal(result.intersection_normal);
 	}
 
@@ -2906,10 +3534,10 @@ PointedThing Game::updatePointedThing(
 
 		// Modify final color a bit with time
 		u32 timer = client->getEnv().getFrameTime() % 5000;
-		float timerf = (float) (core::PI * ((timer / 2500.0) - 0.5));
+		float timerf = (float) (irr::core::PI * ((timer / 2500.0) - 0.5));
 		float sin_r = 0.08f * std::sin(timerf);
-		float sin_g = 0.08f * std::sin(timerf + core::PI * 0.5f);
-		float sin_b = 0.08f * std::sin(timerf + core::PI);
+		float sin_g = 0.08f * std::sin(timerf + irr::core::PI * 0.5f);
+		float sin_b = 0.08f * std::sin(timerf + irr::core::PI);
 		c.setRed(core::clamp(core::round32(c.getRed() * (0.8 + sin_r)), 0, 255));
 		c.setGreen(core::clamp(core::round32(c.getGreen() * (0.8 + sin_g)), 0, 255));
 		c.setBlue(core::clamp(core::round32(c.getBlue() * (0.8 + sin_b)), 0, 255));
@@ -3010,7 +3638,21 @@ bool Game::nodePlacement(const ItemDefinition &selected_def,
 		if (nodedef_manager->get(map.getNode(nodepos)).rightclickable)
 			client->interact(INTERACT_PLACE, pointed);
 
-		m_game_formspec.showNodeFormspec(meta->getString("formspec"), nodepos);
+		infostream << "Launching custom inventory view" << std::endl;
+
+		InventoryLocation inventoryloc;
+		inventoryloc.setNodeMeta(nodepos);
+
+		NodeMetadataFormSource *fs_src = new NodeMetadataFormSource(
+			&client->getEnv().getClientMap(), nodepos);
+		TextDest *txt_dst = new TextDestNodeMetadata(nodepos, client);
+
+		auto *&formspec = m_game_ui->updateFormspec("");
+		GUIFormSpecMenu::create(formspec, client, m_rendering_engine->get_gui_env(),
+			&input->joystick, fs_src, txt_dst, client->getFormspecPrepend(),
+			sound_manager.get());
+
+		formspec->setFormSpec(meta->getString("formspec"), inventoryloc);
 		return false;
 	}
 
@@ -3074,8 +3716,9 @@ bool Game::nodePlacement(const ItemDefinition &selected_def,
 			u8 predicted_param2 = dir.Y < 0 ? 1 : 0;
 			if (selected_def.wallmounted_rotate_vertical) {
 				bool rotate90 = false;
+				v3f fnodepos = v3f(neighborpos.X, neighborpos.Y, neighborpos.Z);
 				v3f ppos = client->getEnv().getLocalPlayer()->getPosition() / BS;
-				v3f pdir = v3f::from(neighborpos) - ppos;
+				v3f pdir = fnodepos - ppos;
 				switch (predicted_f.drawtype) {
 					case NDT_TORCHLIKE: {
 						rotate90 = !((pdir.X < 0 && pdir.Z > 0) ||
@@ -3178,24 +3821,14 @@ bool Game::nodePlacement(const ItemDefinition &selected_def,
 	try {
 		LocalPlayer *player = client->getEnv().getLocalPlayer();
 
-		bool build_where_you_stand = g_settings->getBool("enable_build_where_you_stand");
-		bool stands_inside = false;
-		if (!build_where_you_stand) {
-			// Check if attempting to place a node that player stands inside,
-			// depending on the player's height
-			aabb3f collisionbox = player->getCollisionbox();
-			int player_height = ceilf((collisionbox.MaxEdge.Y - collisionbox.MinEdge.Y) / BS);
-			player_height = MYMAX(player_height, 1);
-			v3s16 diff = neighborpos - player->getStandingNodePos();
-			stands_inside = (diff.X == 0 && diff.Z == 0 && diff.Y >= 1 && diff.Y <= player_height);
-		}
-
 		// Don't place node when player would be inside new node
 		// NOTE: This is to be eventually implemented by a mod as client-side Lua
 		if (!predicted_f.walkable ||
-				build_where_you_stand ||
+				g_settings->getBool("enable_build_where_you_stand") ||
 				(client->checkPrivilege("noclip") && g_settings->getBool("noclip")) ||
-				(predicted_f.walkable && !stands_inside)) {
+				(predicted_f.walkable &&
+					neighborpos != player->getStandingNodePos() + v3s16(0, 1, 0) &&
+					neighborpos != player->getStandingNodePos() + v3s16(0, 2, 0))) {
 			// This triggers the required mesh update too
 			client->addNode(p, predicted_node);
 			// Report to server
@@ -3216,8 +3849,8 @@ bool Game::nodePlacement(const ItemDefinition &selected_def,
 	}
 }
 
-void Game::handlePointingAtObject(const PointedThing &pointed, const ItemStack &tool_item,
-		const ItemStack &hand_item, const v3f &player_position, bool show_debug)
+void Game::handlePointingAtObject(const PointedThing &pointed,
+		const ItemStack &tool_item, const v3f &player_position, bool show_debug)
 {
 	std::wstring infotext = unescape_translate(
 		utf8_to_wide(runData.selected_object->infoText()));
@@ -3247,7 +3880,6 @@ void Game::handlePointingAtObject(const PointedThing &pointed, const ItemStack &
 		if (do_punch) {
 			infostream << "Punched object" << std::endl;
 			runData.punching = true;
-			runData.nodig_delay_timer = std::max(0.15f, m_repeat_dig_time);
 		}
 
 		if (do_punch_damage) {
@@ -3256,7 +3888,7 @@ void Game::handlePointingAtObject(const PointedThing &pointed, const ItemStack &
 			v3f dir = (objpos - player_position).normalize();
 
 			bool disable_send = runData.selected_object->directReportPunch(
-					dir, &tool_item, &hand_item, runData.time_from_last_punch);
+					dir, &tool_item, runData.time_from_last_punch);
 			runData.time_from_last_punch = 0;
 
 			if (!disable_send)
@@ -3277,14 +3909,13 @@ void Game::handleDigging(const PointedThing &pointed, const v3s16 &nodepos,
 	ClientMap &map = client->getEnv().getClientMap();
 	MapNode n = map.getNode(nodepos);
 	const auto &features = nodedef_manager->get(n);
-	const ItemStack &tool_item = selected_item.name.empty() ? hand_item : selected_item;
 
 	// NOTE: Similar piece of code exists on the server side for
 	// cheat detection.
 	// Get digging parameters
 	DigParams params = getDigParams(features.groups,
-			&tool_item.getToolCapabilities(itemdef_manager, &hand_item),
-			tool_item.wear);
+			&selected_item.getToolCapabilities(itemdef_manager),
+			selected_item.wear);
 
 	// If can't dig, try hand
 	if (!params.diggable) {
@@ -3297,8 +3928,10 @@ void Game::handleDigging(const PointedThing &pointed, const v3s16 &nodepos,
 		runData.dig_time_complete = 10000000.0;
 	} else {
 		runData.dig_time_complete = params.time;
-		if (g_settings->getBool("enable_dig_particles")) {
-			client->getParticleManager()->addNodeParticle(player, nodepos, n);
+
+		if (m_cache_enable_particles) {
+			client->getParticleManager()->addNodeParticle(client,
+					player, nodepos, n, features);
 		}
 	}
 
@@ -3384,9 +4017,11 @@ void Game::handleDigging(const PointedThing &pointed, const v3s16 &nodepos,
 
 		client->interact(INTERACT_DIGGING_COMPLETED, pointed);
 
-		if (g_settings->getBool("enable_dig_particles")) {
-			client->getParticleManager()->addDiggingParticles(player, nodepos, n);
+		if (m_cache_enable_particles) {
+			client->getParticleManager()->addDiggingParticles(client,
+				player, nodepos, n, features);
 		}
+
 
 		// Send event to trigger sound
 		client->getEventManager()->put(new NodeDugEvent(nodepos, n));
@@ -3405,7 +4040,6 @@ void Game::handleDigging(const PointedThing &pointed, const v3s16 &nodepos,
 void Game::updateFrame(ProfilerGraph *graph, RunStats *stats, f32 dtime,
 		const CameraOrientation &cam)
 {
-	ZoneScoped;
 	TimeTaker tt_update("Game::updateFrame()");
 	LocalPlayer *player = client->getEnv().getLocalPlayer();
 
@@ -3432,24 +4066,22 @@ void Game::updateFrame(ProfilerGraph *graph, RunStats *stats, f32 dtime,
 		Calculate general brightness
 	*/
 	u32 daynight_ratio = client->getEnv().getDayNightRatio();
-	float time_brightness = decode_light_f((float)daynight_ratio / 1000.0f);
+	float time_brightness = decode_light_f((float)daynight_ratio / 1000.0);
 	float direct_brightness;
 	bool sunlight_seen;
 
 	// When in noclip mode force same sky brightness as above ground so you
 	// can see properly
-	bool noclip_fly = draw_control->allow_noclip &&
-			m_cache_enable_free_move &&
-			client->checkPrivilege("fly");
-	if (!sky->getAutoCaveBrightness() || noclip_fly) {
+	if (draw_control->allow_noclip && m_cache_enable_free_move &&
+		client->checkPrivilege("fly")) {
 		direct_brightness = time_brightness;
 		sunlight_seen = true;
 	} else {
 		float old_brightness = sky->getBrightness();
 		direct_brightness = client->getEnv().getClientMap()
 				.getBackgroundBrightness(MYMIN(runData.fog_range * 1.2, 60 * BS),
-						daynight_ratio, (int)(old_brightness * 255.5), &sunlight_seen)
-				/ 255.0;
+					daynight_ratio, (int)(old_brightness * 255.5), &sunlight_seen)
+				    / 255.0;
 	}
 
 	float time_of_day_smooth = runData.time_of_day_smooth;
@@ -3479,7 +4111,8 @@ void Game::updateFrame(ProfilerGraph *graph, RunStats *stats, f32 dtime,
 	/*
 		Update clouds
 	*/
-	updateClouds(dtime);
+	if (clouds)
+		updateClouds(dtime);
 
 	/*
 		Update particles
@@ -3521,9 +4154,7 @@ void Game::updateFrame(ProfilerGraph *graph, RunStats *stats, f32 dtime,
 		// Update wielded tool
 		ItemStack selected_item, hand_item;
 		ItemStack &tool_item = player->getWieldedItem(&selected_item, &hand_item);
-
-		bool skip_anim = client->consumeSkipNextWieldAnimation();
-		camera->wield(tool_item, !skip_anim);
+		camera->wield(tool_item);
 	}
 
 	/*
@@ -3533,33 +4164,56 @@ void Game::updateFrame(ProfilerGraph *graph, RunStats *stats, f32 dtime,
 	runData.update_draw_list_timer += dtime;
 	runData.touch_blocks_timer += dtime;
 
-	constexpr float update_draw_list_delta = 0.2f;
-	constexpr float touch_mapblock_delta = 4.0f;
+	float update_draw_list_delta = 0.2f;
 
 	v3f camera_direction = camera->getDirection();
-
-	auto &client_map = client->getEnv().getClientMap();
 
 	// call only one of updateDrawList, touchMapBlocks, or updateShadow per frame
 	// (the else-ifs below are intentional)
 	if (runData.update_draw_list_timer >= update_draw_list_delta
-			|| runData.update_draw_list_last_cam_dir.getDistanceFrom(camera_direction) > 0.2f
+			|| runData.update_draw_list_last_cam_dir.getDistanceFrom(camera_direction) > 0.2
 			|| m_camera_offset_changed
-			|| client_map.needsUpdateDrawList()) {
-		client_map.updateDrawList();
+			|| client->getEnv().getClientMap().needsUpdateDrawList()) {
 		runData.update_draw_list_timer = 0;
+		client->getEnv().getClientMap().updateDrawList();
 		runData.update_draw_list_last_cam_dir = camera_direction;
-	} else if (runData.touch_blocks_timer > touch_mapblock_delta) {
-		client_map.touchMapBlocks();
+	} else if (runData.touch_blocks_timer > update_draw_list_delta) {
+		client->getEnv().getClientMap().touchMapBlocks();
 		runData.touch_blocks_timer = 0;
 	} else if (RenderingEngine::get_shadow_renderer()) {
 		updateShadows();
 	}
 
-	m_game_ui->update(*stats, client, draw_control, cam, runData.pointed_old,
-			gui_chat_console.get(), dtime);
+	m_game_ui->update(*stats, client, draw_control, cam, runData.pointed_old, gui_chat_console, dtime);
 
-	m_game_formspec.update();
+	/*
+	   make sure menu is on top
+	   1. Delete formspec menu reference if menu was removed
+	   2. Else, make sure formspec menu is on top
+	*/
+	auto formspec = m_game_ui->getFormspecGUI();
+	do { // breakable. only runs for one iteration
+		if (!formspec)
+			break;
+
+		if (formspec->getReferenceCount() == 1) {
+			// See GUIFormSpecMenu::create what refcnt = 1 means
+			m_game_ui->deleteFormspec();
+			break;
+		}
+
+		auto &loc = formspec->getFormspecLocation();
+		if (loc.type == InventoryLocation::NODEMETA) {
+			NodeMetadata *meta = client->getEnv().getClientMap().getNodeMetadata(loc.p);
+			if (!meta || meta->getString("formspec").empty()) {
+				formspec->quitMenu();
+				break;
+			}
+		}
+
+		if (isMenuActive())
+			guiroot->bringToFront(formspec);
+	} while (false);
 
 	/*
 		==================== Drawing begins ====================
@@ -3625,35 +4279,26 @@ void Game::updateShadows()
 
 	float in_timeofday = std::fmod(runData.time_of_day_smooth, 1.0f);
 
-	const auto &lighting = client->getEnv().getLocalPlayer()->getLighting();
-	shadow->setShadowTint(lighting.shadow_tint);
+	float timeoftheday = getWickedTimeOfDay(in_timeofday);
+	bool is_day = timeoftheday > 0.25 && timeoftheday < 0.75;
+	bool is_shadow_visible = is_day ? sky->getSunVisible() : sky->getMoonVisible();
+	shadow->setShadowIntensity(is_shadow_visible ? client->getEnv().getLocalPlayer()->getLighting().shadow_intensity : 0.0f);
 
+	timeoftheday = std::fmod(timeoftheday + 0.75f, 0.5f) + 0.25f;
 	const float offset_constant = 10000.0f;
 
-	v3f light;
-	if (lighting.shadow_direction.getLengthSQ() > 0.0f) {
-		// Custom shadow direction: bypass sun/moon visibility check
-		shadow->setShadowIntensity(lighting.shadow_intensity);
-		light = lighting.shadow_direction;
-	} else {
-		float timeoftheday = getWickedTimeOfDay(in_timeofday);
-		bool is_day = timeoftheday > 0.25f && timeoftheday < 0.75f;
-		bool is_shadow_visible = is_day ? sky->getSunVisible() : sky->getMoonVisible();
-		shadow->setShadowIntensity(is_shadow_visible ? lighting.shadow_intensity : 0.0f);
-		light = is_day ? sky->getSunDirection() : sky->getMoonDirection();
-	}
+	v3f light = is_day ? sky->getSunDirection() : sky->getMoonDirection();
 
 	v3f sun_pos = light * offset_constant;
+
 	shadow->getDirectionalLight().setDirection(sun_pos);
 	shadow->setTimeOfDay(in_timeofday);
 
-	shadow->getDirectionalLight().updateFrustum(camera, client);
+	shadow->getDirectionalLight().update_frustum(camera, client, m_camera_offset_changed);
 }
 
 void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 {
-	ZoneScoped;
-
 	const video::SColor fog_color = this->sky->getFogColor();
 	const video::SColor sky_color = this->sky->getSkyColor();
 
@@ -3696,7 +4341,7 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 			(player->hud_flags & HUD_FLAG_CROSSHAIR_VISIBLE) &&
 			(this->camera->getCameraMode() != CAMERA_MODE_THIRD_FRONT));
 
-	if (isTouchShootlineUsed())
+	if (g_touchscreengui && isTouchCrosshairDisabled())
 		draw_crosshair = false;
 
 	this->m_rendering_engine->draw_scene(sky_color, this->m_game_ui->m_flags.show_hud,
@@ -3707,11 +4352,8 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 	*/
 	v2u32 screensize = this->driver->getScreenSize();
 
-	if (this->m_game_ui->m_flags.show_profiler_graph) {
-		auto font = g_fontengine->getFont(
-			g_fontengine->getDefaultFontSize() * 0.9f, FM_Mono);
-		graph->draw(10, screensize.Y - 10, driver, font);
-	}
+	if (this->m_game_ui->m_flags.show_profiler_graph)
+		graph->draw(10, screensize.Y - 10, driver, g_fontengine->getFont());
 
 	/*
 		Damage flash
@@ -3722,9 +4364,6 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 					core::rect<s32>(0, 0, screensize.X, screensize.Y),
 					NULL);
 	}
-
-	// Must be called immediately before endScene() to capture the rendered frame
-	this->client->takeScreenshotIfRequested();
 
 	this->driver->endScene();
 
@@ -3750,19 +4389,14 @@ void Game::settingChangedCallback(const std::string &setting_name, void *data)
 
 void Game::readSettings()
 {
-	LogLevel chat_log_level = Logger::stringToLevel(g_settings->get("chat_log_level"));
-	if (chat_log_level == LL_MAX) {
-		warningstream << "Supplied unrecognized chat_log_level; showing none." << std::endl;
-		chat_log_level = LL_NONE;
-	}
-	m_chat_log_buf.setLogLevel(chat_log_level);
-
 	m_cache_doubletap_jump               = g_settings->getBool("doubletap_jump");
-	m_cache_toggle_sneak_key             = g_settings->getBool("toggle_sneak_key");
-	m_cache_toggle_aux1_key              = g_settings->getBool("toggle_aux1_key");
+	m_cache_enable_clouds                = g_settings->getBool("enable_clouds");
+	m_cache_enable_joysticks             = g_settings->getBool("enable_joysticks");
+	m_cache_enable_particles             = g_settings->getBool("enable_particles");
 	m_cache_enable_fog                   = g_settings->getBool("enable_fog");
 	m_cache_mouse_sensitivity            = g_settings->getFloat("mouse_sensitivity", 0.001f, 10.0f);
-	m_repeat_place_time                  = g_settings->getFloat("repeat_place_time", 0.16f, 2.0f);
+	m_cache_joystick_frustum_sensitivity = std::max(g_settings->getFloat("joystick_frustum_sensitivity"), 0.001f);
+	m_repeat_place_time                  = g_settings->getFloat("repeat_place_time", 0.001f, 2.0f);
 	m_repeat_dig_time                    = g_settings->getFloat("repeat_dig_time", 0.0f, 2.0f);
 
 	m_cache_enable_noclip                = g_settings->getBool("noclip");
@@ -3770,11 +4404,11 @@ void Game::readSettings()
 
 	m_cache_cam_smoothing = 0;
 	if (g_settings->getBool("cinematic"))
-		m_cache_cam_smoothing = g_settings->getFloat("cinematic_camera_smoothing");
+		m_cache_cam_smoothing = 1 - g_settings->getFloat("cinematic_camera_smoothing");
 	else
-		m_cache_cam_smoothing = g_settings->getFloat("camera_smoothing");
+		m_cache_cam_smoothing = 1 - g_settings->getFloat("camera_smoothing");
 
-	m_cache_cam_smoothing = std::max(0.0f, m_cache_cam_smoothing);
+	m_cache_cam_smoothing = rangelim(m_cache_cam_smoothing, 0.01f, 1.0f);
 	m_cache_mouse_sensitivity = rangelim(m_cache_mouse_sensitivity, 0.001, 100.0);
 
 	m_invert_mouse = g_settings->getBool("invert_mouse");
@@ -3786,24 +4420,163 @@ void Game::readSettings()
 
 /****************************************************************************/
 /****************************************************************************
+ Shutdown / cleanup
+ ****************************************************************************/
+/****************************************************************************/
+
+void Game::showDeathFormspec()
+{
+	static std::string formspec_str =
+		std::string("formspec_version[1]") +
+		SIZE_TAG
+		"bgcolor[#320000b4;true]"
+		"label[4.85,1.35;" + gettext("You died") + "]"
+		"button_exit[4,3;3,0.5;btn_respawn;" + gettext("Respawn") + "]"
+		;
+
+	/* Create menu */
+	/* Note: FormspecFormSource and LocalFormspecHandler  *
+	 * are deleted by guiFormSpecMenu                     */
+	FormspecFormSource *fs_src = new FormspecFormSource(formspec_str);
+	LocalFormspecHandler *txt_dst = new LocalFormspecHandler("MT_DEATH_SCREEN", client);
+
+	auto *&formspec = m_game_ui->getFormspecGUI();
+	GUIFormSpecMenu::create(formspec, client, m_rendering_engine->get_gui_env(),
+		&input->joystick, fs_src, txt_dst, client->getFormspecPrepend(),
+		sound_manager.get());
+	formspec->setFocus("btn_respawn");
+}
+
+#define GET_KEY_NAME(KEY) gettext(getKeySetting(#KEY).name())
+void Game::showPauseMenu()
+{
+	std::string control_text;
+
+	if (g_touchscreengui) {
+		control_text = strgettext("Controls:\n"
+			"No menu open:\n"
+			"- slide finger: look around\n"
+			"- tap: place/punch/use (default)\n"
+			"- long tap: dig/use (default)\n"
+			"Menu/inventory open:\n"
+			"- double tap (outside):\n"
+			" --> close\n"
+			"- touch stack, touch slot:\n"
+			" --> move stack\n"
+			"- touch&drag, tap 2nd finger\n"
+			" --> place single item to slot\n"
+			);
+	}
+
+	float ypos = simple_singleplayer_mode ? 0.7f : 0.1f;
+	std::ostringstream os;
+
+	os << "formspec_version[1]" << SIZE_TAG
+		<< "button_exit[4," << (ypos++) << ";3,0.5;btn_continue;"
+		<< strgettext("Continue") << "]";
+
+	if (!simple_singleplayer_mode) {
+		os << "button_exit[4," << (ypos++) << ";3,0.5;btn_change_password;"
+			<< strgettext("Change Password") << "]";
+	} else {
+		os << "field[4.95,0;5,1.5;;" << strgettext("Game paused") << ";]";
+	}
+
+#ifndef __ANDROID__
+#if USE_SOUND
+	if (g_settings->getBool("enable_sound")) {
+		os << "button_exit[4," << (ypos++) << ";3,0.5;btn_sound;"
+			<< strgettext("Sound Volume") << "]";
+	}
+#endif
+	os		<< "button_exit[4," << (ypos++) << ";3,0.5;btn_key_config;"
+		<< strgettext("Controls")  << "]";
+#endif
+	os		<< "button_exit[4," << (ypos++) << ";3,0.5;btn_exit_menu;"
+		<< strgettext("Exit to Menu") << "]";
+	os		<< "button_exit[4," << (ypos++) << ";3,0.5;btn_exit_os;"
+		<< strgettext("Exit to OS")   << "]";
+	if (!control_text.empty()) {
+	os		<< "textarea[7.5,0.25;3.9,6.25;;" << control_text << ";]";
+	}
+	os		<< "textarea[0.4,0.25;3.9,6.25;;" << PROJECT_NAME_C " " VERSION_STRING "\n"
+		<< "\n"
+		<<  strgettext("Game info:") << "\n";
+	const std::string &address = client->getAddressName();
+	os << strgettext("- Mode: ");
+	if (!simple_singleplayer_mode) {
+		if (address.empty())
+			os << strgettext("Hosting server");
+		else
+			os << strgettext("Remote server");
+	} else {
+		os << strgettext("Singleplayer");
+	}
+	os << "\n";
+	if (simple_singleplayer_mode || address.empty()) {
+		static const std::string on = strgettext("On");
+		static const std::string off = strgettext("Off");
+		// Note: Status of enable_damage and creative_mode settings is intentionally
+		// NOT shown here because the game might roll its own damage system and/or do
+		// a per-player Creative Mode, in which case writing it here would mislead.
+		bool damage = g_settings->getBool("enable_damage");
+		const std::string &announced = g_settings->getBool("server_announce") ? on : off;
+		if (!simple_singleplayer_mode) {
+			if (damage) {
+				const std::string &pvp = g_settings->getBool("enable_pvp") ? on : off;
+				//~ PvP = Player versus Player
+				os << strgettext("- PvP: ") << pvp << "\n";
+			}
+			os << strgettext("- Public: ") << announced << "\n";
+			std::string server_name = g_settings->get("server_name");
+			str_formspec_escape(server_name);
+			if (announced == on && !server_name.empty())
+				os << strgettext("- Server Name: ") << server_name;
+
+		}
+	}
+	os << ";]";
+
+	/* Create menu */
+	/* Note: FormspecFormSource and LocalFormspecHandler  *
+	 * are deleted by guiFormSpecMenu                     */
+	FormspecFormSource *fs_src = new FormspecFormSource(os.str());
+	LocalFormspecHandler *txt_dst = new LocalFormspecHandler("MT_PAUSE_MENU");
+
+	auto *&formspec = m_game_ui->getFormspecGUI();
+	GUIFormSpecMenu::create(formspec, client, m_rendering_engine->get_gui_env(),
+			&input->joystick, fs_src, txt_dst, client->getFormspecPrepend(),
+			sound_manager.get());
+	formspec->setFocus("btn_continue");
+	// game will be paused in next step, if in singleplayer (see m_is_paused)
+	formspec->doPause = true;
+}
+
+/****************************************************************************/
+/****************************************************************************
  extern function for launching the game
  ****************************************************************************/
 /****************************************************************************/
 
-void the_game(volatile std::sig_atomic_t *kill,
+void the_game(bool *kill,
 		InputHandler *input,
 		RenderingEngine *rendering_engine,
-		GameStartData &start_data,
-		GameErrorData &errordata,
-		ChatBackend &chat_backend)
+		const GameStartData &start_data,
+		std::string &error_message,
+		ChatBackend &chat_backend,
+		bool *reconnect_requested) // Used for local game
 {
 	Game game;
-	std::string error_message;
+
+	/* Make a copy of the server address because if a local singleplayer server
+	 * is created then this is updated and we don't want to change the value
+	 * passed to us by the calling function
+	 */
 
 	try {
 
 		if (game.startup(kill, input, rendering_engine, start_data,
-				errordata, &chat_backend)) {
+				error_message, reconnect_requested, &chat_backend)) {
 			game.run();
 		}
 
@@ -3811,24 +4584,21 @@ void the_game(volatile std::sig_atomic_t *kill,
 		const std::string ver_err = fmtgettext("The server is probably running a different version of %s.", PROJECT_NAME_C);
 		error_message = strgettext("A serialization error occurred:") +"\n"
 				+ e.what() + "\n\n" + ver_err;
+		errorstream << error_message << std::endl;
 	} catch (ServerError &e) {
-		error_message = "ServerError: ";
-		error_message.append(e.what());
+		error_message = e.what();
+		errorstream << "ServerError: " << error_message << std::endl;
 	} catch (ModError &e) {
 		// DO NOT TRANSLATE the `ModError`, it's used by `ui.lua`
 		error_message = std::string("ModError: ") + e.what() +
 				strgettext("\nCheck debug.txt for details.");
+		errorstream << error_message << std::endl;
 	} catch (con::PeerNotFoundException &e) {
 		error_message = gettext("Connection error (timed out?)");
+		errorstream << error_message << std::endl;
 	} catch (ShaderException &e) {
 		error_message = e.what();
-	} catch (SocketException &e) {
-		error_message = e.what();
-	}
-
-	if (!error_message.empty()) {
 		errorstream << error_message << std::endl;
-		errordata.message = std::move(error_message);
 	}
 
 	game.shutdown();
